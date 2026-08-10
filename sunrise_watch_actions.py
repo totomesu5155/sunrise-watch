@@ -7,6 +7,7 @@ import re
 import sys
 import time
 import urllib.request
+import urllib.parse
 from datetime import datetime, time as dt_time
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -150,50 +151,58 @@ def save_state(state: dict) -> None:
     tmp.replace(STATE_FILE)
 
 
-def send_ntfy(name: str, statuses: dict[str, str], url: str) -> None:
+def _ntfy_json_endpoint_and_topic() -> tuple[str, str]:
+    """NTFY_TOPIC_URL から ntfy のルートURLとトピック名を取り出す。"""
     ntfy_url = require_env("NTFY_TOPIC_URL")
+    parts = urllib.parse.urlsplit(ntfy_url)
+    topic = urllib.parse.unquote(parts.path.strip("/"))
+    if not parts.scheme or not parts.netloc or not topic:
+        raise RuntimeError("NTFY_TOPIC_URL は https://ntfy.sh/トピック名 の形で設定してください")
+    root_url = urllib.parse.urlunsplit((parts.scheme, parts.netloc, "/", "", ""))
+    return root_url, topic
+
+
+def _publish_ntfy(payload: dict) -> None:
+    root_url, topic = _ntfy_json_endpoint_and_topic()
+    body = dict(payload)
+    body["topic"] = topic
+
+    # 日本語のtitle/messageはHTTPヘッダーではなくJSON本文に入れる。
+    # Python urllib のヘッダーはLatin-1制約があるため、この方式が安全。
+    req = urllib.request.Request(
+        root_url,
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json; charset=utf-8"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as response:
+        if response.status >= 400:
+            raise RuntimeError(f"ntfy HTTP {response.status}")
+
+
+def send_ntfy(name: str, statuses: dict[str, str], url: str) -> None:
     trip_label = require_env("TRIP_LABEL")
     status_text = format_statuses(statuses)
 
-    title = f"サンライズ出雲 空席: {name}"
-    message = (
-        f"{trip_label}\n"
-        f"{name}: {status_text}\n"
-        "今すぐe5489を確認してください。"
-    )
-
-    req = urllib.request.Request(
-        ntfy_url,
-        data=message.encode("utf-8"),
-        method="POST",
-        headers={
-            "Title": title,
-            "Priority": "urgent",
-            "Tags": "rotating_light,train",
-            "Click": url,
-            "Content-Type": "text/plain; charset=utf-8",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=30) as response:
-        if response.status >= 400:
-            raise RuntimeError(f"ntfy HTTP {response.status}")
+    _publish_ntfy({
+        "title": f"サンライズ出雲 空席: {name}",
+        "message": (
+            f"{trip_label}\n"
+            f"{name}: {status_text}\n"
+            "今すぐe5489を確認してください。"
+        ),
+        "priority": 5,
+        "tags": ["rotating_light", "train"],
+        "click": url,
+    })
 
 
 def send_test_ntfy() -> None:
-    ntfy_url = require_env("NTFY_TOPIC_URL")
-    req = urllib.request.Request(
-        ntfy_url,
-        data="GitHub Actions からの ntfy テスト通知です。".encode("utf-8"),
-        method="POST",
-        headers={
-            "Title": "サンライズ監視 GitHub Actions テスト",
-            "Priority": "high",
-            "Content-Type": "text/plain; charset=utf-8",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=30) as response:
-        if response.status >= 400:
-            raise RuntimeError(f"ntfy HTTP {response.status}")
+    _publish_ntfy({
+        "title": "サンライズ監視 GitHub Actions テスト",
+        "message": "GitHub Actions からの ntfy テスト通知です。",
+        "priority": 4,
+    })
 
 
 def build_targets() -> list[dict[str, str]]:
