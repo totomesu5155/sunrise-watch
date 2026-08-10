@@ -1,17 +1,11 @@
 name: Sunrise Izumo Watch
 
 on:
-  # 5分間隔。ただし 01:30-05:30 JST は schedule 自体を作らない。
-  # 毎時00分の混雑を少し避けるため、02,07,12...57分にずらしている。
+  # 5分ごと（毎時 02,07,12,...57 分）。
+  # 01:30-05:30 JST もWorkflow自体は起動しますが、
+  # Python側が即終了するため e5489 にはアクセスしません。
   schedule:
-    - cron: '32,37,42,47,52,57 5 * * *'
-      timezone: 'Asia/Tokyo'
-    - cron: '2,7,12,17,22,27,32,37,42,47,52,57 6-23 * * *'
-      timezone: 'Asia/Tokyo'
-    - cron: '2,7,12,17,22,27,32,37,42,47,52,57 0 * * *'
-      timezone: 'Asia/Tokyo'
-    - cron: '2,7,12,17,22,27 1 * * *'
-      timezone: 'Asia/Tokyo'
+    - cron: '2/5 * * * *'
 
   # 手動テスト用。pull_request / pull_request_target / push は定義しない。
   workflow_dispatch:
@@ -93,7 +87,6 @@ jobs:
         if: github.event_name != 'workflow_dispatch' || inputs.test_ntfy != true
         run: python sunrise_watch_actions.py
 
-      # stateには空席通知済みかどうかだけを保存。URLやntfyトピックは入らない。
       - name: Ensure monitor state exists
         if: always() && (github.event_name != 'workflow_dispatch' || inputs.test_ntfy != true)
         run: mkdir -p .state && test -f .state/sunrise_state.json || echo '{}' > .state/sunrise_state.json
