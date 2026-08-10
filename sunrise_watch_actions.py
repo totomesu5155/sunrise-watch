@@ -17,15 +17,14 @@ from playwright.sync_api import sync_playwright
 JST = ZoneInfo("Asia/Tokyo")
 MAINTENANCE_START = dt_time(1, 30)
 MAINTENANCE_END = dt_time(5, 30)
-
+TOP_URL = "https://e5489.jr-odekake.net/e5489/cspc/CBTopMenuPC?screenId=CP6102"
+ENTRY_URL = "https://e5489.jr-odekake.net/e5489/cspc/CBTrainEntryBackPC"
 STATE_FILE = Path(os.getenv("STATE_FILE", ".state/sunrise_state.json"))
-AVAILABLE_MARKS = {"○", "△", "あり"}
-
 MAX_ATTEMPTS = 2
 RETRY_WAIT_SECONDS = 15
 
 
-class TemporaryCheckError(RuntimeError):
+class TemporaryPageError(RuntimeError):
     pass
 
 
@@ -49,244 +48,8 @@ def in_maintenance() -> bool:
     return MAINTENANCE_START <= t < MAINTENANCE_END
 
 
-def normalize_text(s: str | None) -> str:
-    if not s:
-        return ""
-    return re.sub(r"\s+", " ", s).strip()
-
-
-def status_from_text(text: str) -> str | None:
-    t = normalize_text(text)
-    if not t:
-        return None
-
-    if "残りわずか" in t or "△" in t:
-        return "△"
-    if "空席あり" in t or "○" in t or "〇" in t:
-        return "○"
-    if "満席" in t or "選択不可" in t or "×" in t or "✕" in t or "✖" in t:
-        return "×"
-    return None
-
-
-def collect_table_rows(page) -> list[list[str]]:
-    return page.evaluate(
-        """
-        () => Array.from(document.querySelectorAll('tr')).map(tr =>
-          Array.from(tr.querySelectorAll('th, td')).map(cell => {
-            const parts = [];
-            const text = (cell.innerText || cell.textContent || '').trim();
-            if (text) parts.push(text);
-            for (const el of cell.querySelectorAll('img, input, button, a, span')) {
-              for (const attr of ['alt', 'title', 'value', 'aria-label']) {
-                const v = el.getAttribute && el.getAttribute(attr);
-                if (v) parts.push(v);
-              }
-              const et = (el.innerText || el.textContent || '').trim();
-              if (et) parts.push(et);
-            }
-            return parts.join(' | ');
-          })
-        )
-        """
-    )
-
-
-def extract_from_table(page, equipment: str) -> dict[str, str] | None:
-    rows = collect_table_rows(page)
-
-    for cells in rows:
-        normalized = [normalize_text(c) for c in cells]
-        equipment_index = next(
-            (i for i, c in enumerate(normalized) if equipment in c),
-            None,
-        )
-        if equipment_index is None:
-            continue
-
-        statuses: list[str] = []
-        for cell in normalized[equipment_index + 1:]:
-            st = status_from_text(cell)
-            if st is not None:
-                statuses.append(st)
-
-        if statuses:
-            result = {"空席": statuses[0]}
-            if len(statuses) >= 2:
-                result["空席2"] = statuses[1]
-            return result
-
-    return None
-
-
-def collect_card_candidates(page, equipment: str) -> list[dict]:
-    """
-    tableではないカード型画面から空席状態候補を探す。
-    close/remove系の×ボタンは除外する。
-    """
-    return page.evaluate(
-        """
-        (equipment) => {
-          const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
-
-          const visible = el => {
-            const cs = getComputedStyle(el);
-            if (cs.display === 'none' || cs.visibility === 'hidden') return false;
-            const r = el.getBoundingClientRect();
-            return r.width > 0 && r.height > 0;
-          };
-
-          const ownText = el => {
-            let s = '';
-            for (const n of el.childNodes) {
-              if (n.nodeType === Node.TEXT_NODE) s += ' ' + n.textContent;
-            }
-            for (const a of ['alt', 'title', 'aria-label', 'value']) {
-              const v = el.getAttribute && el.getAttribute(a);
-              if (v) s += ' ' + v;
-            }
-            return norm(s);
-          };
-
-          const classify = t => {
-            if (!t) return null;
-            if (t.includes('残りわずか') || t === '△') return '△';
-            if (t.includes('空席あり') || t === '○' || t === '〇') return '○';
-            if (t.includes('満席') || t.includes('選択不可') ||
-                t === '×' || t === '✕' || t === '✖') return '×';
-            return null;
-          };
-
-          const badToken =
-            /(close|remove|delete|cancel|clear|dismiss|閉じ|削除|取消)/i;
-
-          const out = [];
-
-          for (const el of document.querySelectorAll('*')) {
-            if (!visible(el)) continue;
-
-            const t = ownText(el);
-            const status = classify(t);
-            if (!status) continue;
-
-            let p = el;
-            let context = '';
-            let hasEquipment = false;
-            let badInteractive = false;
-            let depth = 0;
-
-            while (p && depth < 8) {
-              const ptxt = norm(p.innerText || p.textContent || '');
-              const meta = [
-                p.tagName || '',
-                p.id || '',
-                p.className || '',
-                p.getAttribute && p.getAttribute('aria-label') || '',
-                p.getAttribute && p.getAttribute('title') || ''
-              ].join(' ');
-
-              if (badToken.test(meta)) badInteractive = true;
-
-              if ((p.tagName === 'BUTTON' || p.tagName === 'A') &&
-                  (t === '×' || t === '✕' || t === '✖')) {
-                badInteractive = true;
-              }
-
-              if (ptxt.includes(equipment)) {
-                hasEquipment = true;
-                context = ptxt.slice(0, 500);
-                break;
-              }
-
-              p = p.parentElement;
-              depth++;
-            }
-
-            if (!hasEquipment || badInteractive) continue;
-
-            let score = 0;
-            if (t.includes('空席あり') || t.includes('残りわずか') ||
-                t.includes('満席') || t.includes('選択不可')) score += 100;
-            if (['○','〇','△','×','✕','✖'].includes(t)) score += 60;
-            if (context.includes('禁煙') || context.includes('喫煙')) score += 15;
-            if (context.includes('個室')) score += 10;
-
-            out.push({
-              status,
-              text: t.slice(0, 80),
-              score,
-              context: context.slice(0, 220)
-            });
-          }
-
-          out.sort((a, b) => b.score - a.score);
-
-          const seen = new Set();
-          return out.filter(x => {
-            const k = x.status + '|' + x.text + '|' + x.context;
-            if (seen.has(k)) return false;
-            seen.add(k);
-            return true;
-          }).slice(0, 10);
-        }
-        """,
-        equipment,
-    )
-
-
-def extract_equipment_status(page, equipment: str) -> dict[str, str]:
-    # 1. 旧table形式
-    table_result = extract_from_table(page, equipment)
-    if table_result:
-        return table_result
-
-    # 2. カード型DOM
-    candidates = collect_card_candidates(page, equipment)
-    if candidates:
-        return {"空席": candidates[0]["status"]}
-
-    # 3. e5489の経路そのものが「選択不可」なら空席なし扱い
-    body = normalize_text(page.locator("body").inner_text(timeout=10_000))
-    if "この経路は選択できません" in body or "選択不可" in body:
-        return {"空席": "×"}
-
-    # 4. 選択可能な操作ボタンがある場合は空席あり扱い
-    selectable = page.evaluate(
-        """
-        () => Array.from(
-          document.querySelectorAll(
-            'button, input[type=button], input[type=submit], a'
-          )
-        ).some(el => {
-          const t = (
-            (el.innerText || el.value || el.getAttribute('aria-label') || '') + ''
-          ).replace(/\\s+/g, ' ').trim();
-
-          const cs = getComputedStyle(el);
-          const r = el.getBoundingClientRect();
-          const vis =
-            cs.display !== 'none' &&
-            cs.visibility !== 'hidden' &&
-            r.width > 0 &&
-            r.height > 0;
-
-          return vis && /^(選択|選択する|予約|申し込む)$/.test(t);
-        })
-        """
-    )
-
-    if selectable:
-        return {"空席": "○"}
-
-    raise RuntimeError(f"{equipment} の空席状態を取得できませんでした")
-
-
-def is_available(statuses: dict[str, str]) -> bool:
-    return any(v in AVAILABLE_MARKS for v in statuses.values())
-
-
-def format_statuses(statuses: dict[str, str]) -> str:
-    return " / ".join(f"{k}:{v}" for k, v in statuses.items())
+def norm(s: str | None) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
 
 
 def load_state() -> dict:
@@ -301,394 +64,376 @@ def load_state() -> dict:
 def save_state(state: dict) -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(STATE_FILE)
 
 
-def _ntfy_json_endpoint_and_topic() -> tuple[str, str]:
-    ntfy_url = require_env("NTFY_TOPIC_URL")
-    parts = urllib.parse.urlsplit(ntfy_url)
-    topic = urllib.parse.unquote(parts.path.strip("/"))
+# ---------- ntfy ----------
 
-    if not parts.scheme or not parts.netloc or not topic:
+def ntfy_root_topic() -> tuple[str, str]:
+    url = require_env("NTFY_TOPIC_URL")
+    p = urllib.parse.urlsplit(url)
+    topic = urllib.parse.unquote(p.path.strip("/"))
+    if not p.scheme or not p.netloc or not topic:
         raise RuntimeError("NTFY_TOPIC_URL の形式が不正です")
-
-    root_url = urllib.parse.urlunsplit(
-        (parts.scheme, parts.netloc, "/", "", "")
-    )
-    return root_url, topic
+    return urllib.parse.urlunsplit((p.scheme, p.netloc, "/", "", "")), topic
 
 
-def _publish_ntfy(payload: dict) -> None:
-    root_url, topic = _ntfy_json_endpoint_and_topic()
+def publish_ntfy(payload: dict) -> None:
+    root, topic = ntfy_root_topic()
     body = dict(payload)
     body["topic"] = topic
-
     req = urllib.request.Request(
-        root_url,
+        root,
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
         method="POST",
         headers={"Content-Type": "application/json; charset=utf-8"},
     )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        if r.status >= 400:
+            raise RuntimeError(f"ntfy HTTP {r.status}")
 
-    with urllib.request.urlopen(req, timeout=30) as response:
-        if response.status >= 400:
-            raise RuntimeError(f"ntfy HTTP {response.status}")
 
-
-def send_ntfy(name: str, statuses: dict[str, str], url: str) -> None:
-    trip_label = require_env("TRIP_LABEL")
-    status_text = format_statuses(statuses)
-
-    _publish_ntfy({
-        "title": f"サンライズ出雲 空席: {name}",
-        "message": (
-            f"{trip_label}\n"
-            f"{name}: {status_text}\n"
-            "今すぐe5489を確認してください。"
-        ),
+def send_ntfy(stage: str, details: str) -> None:
+    publish_ntfy({
+        "title": "サンライズ出雲 空席あり",
+        "message": f"{require_env('TRIP_LABEL')}\n{stage}\n{details}\ne5489を確認してください。",
         "priority": 5,
         "tags": ["rotating_light", "train"],
-        "click": url,
+        "click": ENTRY_URL,
     })
 
 
 def send_test_ntfy() -> None:
-    _publish_ntfy({
+    publish_ntfy({
         "title": "サンライズ監視 GitHub Actions テスト",
-        "message": "GitHub Actions からの ntfy テスト通知です。",
+        "message": "検索フォーム版からのntfyテスト通知です。",
         "priority": 4,
     })
 
 
-def build_targets() -> list[dict[str, str]]:
-    return [
-        {
-            "name": "シングルデラックス",
-            "url": require_env("URL_SINGLE_DELUXE"),
-            "equipment": "A寝台",
-        },
-        {
-            "name": "シングルツイン",
-            "url": require_env("URL_SINGLE_TWIN"),
-            "equipment": "B寝台",
-        },
-        {
-            "name": "シングル",
-            "url": require_env("URL_SINGLE"),
-            "equipment": "B寝台",
-        },
-        {
-            "name": "ソロ",
-            "url": require_env("URL_SOLO"),
-            "equipment": "B寝台",
-        },
-        {
-            "name": "サンライズツイン",
-            "url": require_env("URL_SUNRISE_TWIN"),
-            "equipment": "B寝台",
-        },
-    ]
+# ---------- ページ操作 ----------
 
-
-def page_diagnostic(page) -> str:
+def page_diag(page) -> str:
     try:
         title = page.title()
+        body = norm(page.locator("body").inner_text(timeout=5000))
     except Exception:
-        title = "(取得不能)"
-
-    try:
-        body = normalize_text(
-            page.locator("body").inner_text(timeout=5_000)
-        )
-    except Exception:
-        body = ""
-
-    marks = []
-    for mark in (
-        "○", "〇", "△", "×", "✕", "✖",
-        "選択不可", "空席あり", "満席",
-    ):
-        if mark in body:
-            marks.append(mark)
-
+        return "page=unreadable"
     return (
-        f"title={title!r}, "
-        f"result_page={'経路・設備選択' in title}, "
-        f"sunrise={'サンライズ' in body}, "
-        f"A寝台={'A寝台' in body}, "
-        f"B寝台={'B寝台' in body}, "
-        f"marks={','.join(marks) or 'none'}"
+        f"title={title!r}, entry={'日時・発着駅選択' in body}, "
+        f"route={'経路・設備選択' in body or '経路・設備選択' in title}, "
+        f"sunrise={'サンライズ' in body}, change={'この列車を変更' in body}"
     )
 
 
-def validate_page(page) -> None:
-    body = normalize_text(
-        page.locator("body").inner_text(timeout=10_000)
-    )
+def is_guide_or_error(page) -> bool:
     title = page.title()
-
-    if "ご案内" in title:
-        raise TemporaryCheckError("一時的なご案内ページ")
-
-    if "入力・選択しなおしてください" in body:
-        raise TemporaryCheckError("入力・選択しなおしページ")
-
-    if "メンテナンス" in body and "経路・設備選択" not in title:
-        raise TemporaryCheckError("メンテナンス案内ページ")
-
-    if "経路・設備選択" not in title and "サンライズ" not in body:
-        raise TemporaryCheckError("検索結果ページを確認できない")
+    body = norm(page.locator("body").inner_text(timeout=10000))
+    return (
+        "ご案内" in title
+        or "処理中にエラーが発生しました" in body
+        or "入力・選択しなおしてください" in body
+        or "アクセスが集中" in body
+        or "大変混み合" in body
+    )
 
 
-def check_url_group_with_retry(
-    page,
-    group: list[dict[str, str]],
-) -> dict[str, dict[str, str] | None]:
-    """
-    同じURLを共有する対象は1回のページ取得でまとめて判定する。
+def goto_entry(page) -> None:
+    # 直リンクだけだとセッション無しの「ご案内」になることがあるので先にトップを開く。
+    page.goto(TOP_URL, wait_until="domcontentloaded", timeout=45000)
+    page.wait_for_timeout(800)
+    page.goto(ENTRY_URL, wait_until="domcontentloaded", timeout=45000)
+    page.wait_for_timeout(1200)
+    if is_guide_or_error(page):
+        raise TemporaryPageError("検索入力画面でご案内/エラー")
+    body = norm(page.locator("body").inner_text(timeout=10000))
+    if "日時・発着駅選択" not in body and "発着駅の指定" not in body:
+        raise TemporaryPageError("検索入力画面を確認できない")
 
-    例:
-      シングルデラックス(A寝台)
-      シングルツイン(B寝台)
-    は同じURLなので、正常ページを1回取得して両方読む。
 
-    一時的な「ご案内」やDOM読取失敗時のみ最大2回まで再取得する。
-    """
-    url = group[0]["url"]
-    results: dict[str, dict[str, str] | None] = {
-        target["name"]: None for target in group
-    }
+def fill_stations(page, depart: str, arrive: str) -> None:
+    inputs = page.locator('input[type="text"]:visible, input:not([type]):visible')
+    if inputs.count() < 2:
+        raise RuntimeError("発駅・着駅入力欄が見つかりません")
+    inputs.nth(0).fill(depart)
+    inputs.nth(1).fill(arrive)
 
-    unresolved = {target["name"] for target in group}
 
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        try:
-            try:
-                page.goto(
-                    url,
-                    wait_until="domcontentloaded",
-                    timeout=45_000,
-                )
-            except Exception as exc:
-                raise TemporaryCheckError(
-                    f"ページ取得失敗 ({type(exc).__name__})"
-                ) from None
+def select_option_matching(page, regexes: list[str]) -> str:
+    selects = page.locator("select:visible")
+    for i in range(selects.count()):
+        sel = selects.nth(i)
+        opts = sel.locator("option")
+        for j in range(opts.count()):
+            op = opts.nth(j)
+            label = norm(op.inner_text())
+            if any(re.search(rx, label) for rx in regexes):
+                value = op.get_attribute("value")
+                if value is not None:
+                    sel.select_option(value=value)
+                else:
+                    sel.select_option(label=label)
+                return label
+    raise RuntimeError(f"select候補が見つかりません: {regexes}")
 
-            page.wait_for_timeout(1200)
-            validate_page(page)
 
-        except TemporaryCheckError as exc:
-            print(
-                f"  -> ページ確認不能 {attempt}/{MAX_ATTEMPTS}: "
-                f"{exc}; {page_diagnostic(page)}",
-                flush=True,
-            )
+def set_control(page, typ: str, text: str, desired: bool) -> None:
+    ok = page.evaluate(
+        """
+        ({typ,text,desired}) => {
+          const norm=s=>(s||'').replace(/\s+/g,' ').trim();
+          for (const el of document.querySelectorAll(`input[type="${typ}"]`)) {
+            if (el.disabled) continue;
+            let s='';
+            if (el.id) {
+              const lab=document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+              if (lab) s+=' '+norm(lab.innerText||lab.textContent);
+            }
+            const pl=el.closest('label');
+            if (pl) s+=' '+norm(pl.innerText||pl.textContent);
+            let p=el.parentElement;
+            for(let i=0;i<4&&p;i++,p=p.parentElement) s+=' '+norm(p.innerText||p.textContent);
+            if (norm(s).includes(text)) {
+              if (el.checked!==desired) el.click();
+              if (el.checked!==desired) {
+                el.checked=desired;
+                el.dispatchEvent(new Event('change',{bubbles:true}));
+              }
+              return el.checked===desired;
+            }
+          }
+          return false;
+        }
+        """,
+        {"typ": typ, "text": text, "desired": desired},
+    )
+    if not ok:
+        raise RuntimeError(f"操作項目を設定できません: {text}")
 
-            if attempt < MAX_ATTEMPTS:
-                print(
-                    f"  -> {RETRY_WAIT_SECONDS}秒待って同じURLを再試行します",
-                    flush=True,
-                )
-                time.sleep(RETRY_WAIT_SECONDS)
-                continue
-            break
 
-        # ページが正常なら、同じページから未解決の設備をまとめて読む。
-        for target in group:
-            name = target["name"]
-            if name not in unresolved:
-                continue
-
-            equipment = target["equipment"]
-            try:
-                statuses = extract_equipment_status(page, equipment)
-                results[name] = statuses
-                unresolved.discard(name)
-
-                if attempt > 1:
-                    print(
-                        f"  -> {name}: 再試行 {attempt} 回目で確認成功",
-                        flush=True,
-                    )
-
-            except Exception:
-                print(
-                    f"  -> {name}: {equipment} の空席状態を取得できない "
-                    f"({attempt}/{MAX_ATTEMPTS}); {page_diagnostic(page)}",
-                    flush=True,
-                )
-
-        if not unresolved:
-            break
-
-        if attempt < MAX_ATTEMPTS:
-            print(
-                f"  -> 未確認 {len(unresolved)}件のため "
-                f"{RETRY_WAIT_SECONDS}秒待って同じURLを再取得します",
-                flush=True,
-            )
-            time.sleep(RETRY_WAIT_SECONDS)
-
-    for name in sorted(unresolved):
-        print(
-            f"  -> {name}: 今回は確認できませんでした。"
-            "空席状態は変更せず、次回の定期実行で再確認します。",
-            flush=True,
+def click_text(page, text: str) -> None:
+    els = page.locator('button:visible,a:visible,input[type="button"]:visible,input[type="submit"]:visible')
+    for i in range(els.count()):
+        el = els.nth(i)
+        label = norm(
+            el.get_attribute("value")
+            or el.get_attribute("aria-label")
+            or el.get_attribute("title")
+            or el.inner_text()
         )
+        if text in label:
+            el.click()
+            return
+    txt = page.get_by_text(text, exact=False)
+    if txt.count():
+        txt.first.click()
+        return
+    raise RuntimeError(f"クリック対象が見つかりません: {text}")
 
-    return results
+
+def fill_search_form(page) -> None:
+    depart = require_env("DEPART_STATION")
+    arrive = require_env("ARRIVE_STATION")
+    dt = datetime.strptime(require_env("TRAVEL_DATE"), "%Y-%m-%d")
+    hour = int(require_env("DEPART_HOUR"))
+    minute = int(require_env("DEPART_MINUTE"))
+
+    fill_stations(page, depart, arrive)
+    d = select_option_matching(page, [rf"{dt.month}\s*月\s*{dt.day}\s*日"])
+    h = select_option_matching(page, [rf"^{hour}\s*時$", rf"^{hour}$"])
+    m = select_option_matching(page, [rf"^{minute:02d}\s*分$", rf"^{minute}\s*分$", rf"^{minute:02d}$", rf"^{minute}$"])
+
+    set_control(page, "radio", "出発", True)
+    set_control(page, "radio", "一度も乗り換えしない", True)
+    set_control(page, "checkbox", "新幹線を利用", False)
+    set_control(page, "checkbox", "特急・急行", True)
+    print(f"  -> 条件設定: {d} {h}{m}", flush=True)
 
 
-def group_targets_by_url(
-    targets: list[dict[str, str]],
-) -> list[list[dict[str, str]]]:
-    """元の表示順を保ったまま、同じURLの対象を1グループにまとめる。"""
-    groups: list[list[dict[str, str]]] = []
-    index_by_url: dict[str, int] = {}
+def submit_search(page) -> None:
+    click_text(page, "検索する")
+    page.wait_for_timeout(1800)
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=20000)
+    except Exception:
+        pass
+    if is_guide_or_error(page):
+        raise TemporaryPageError("検索後にご案内/エラー")
+    body = norm(page.locator("body").inner_text(timeout=10000))
+    if "経路・設備選択" not in body and "サンライズ" not in body:
+        raise TemporaryPageError("検索結果を確認できない")
 
-    for target in targets:
-        url = target["url"]
-        if url in index_by_url:
-            groups[index_by_url[url]].append(target)
-        else:
-            index_by_url[url] = len(groups)
-            groups.append([target])
 
-    return groups
+# ---------- 空席 ----------
+
+def scan_availability(page) -> dict:
+    return page.evaluate(
+        """
+        () => {
+          const norm=s=>(s||'').replace(/\s+/g,' ').trim();
+          const vis=el=>{const c=getComputedStyle(el),r=el.getBoundingClientRect();return c.display!=='none'&&c.visibility!=='hidden'&&r.width>0&&r.height>0};
+          const pos=[]; let x=0; let neg=false;
+          for(const el of document.querySelectorAll('*')){
+            if(!vis(el)) continue;
+            const vals=[];
+            for(const n of el.childNodes) if(n.nodeType===Node.TEXT_NODE&&norm(n.textContent)) vals.push(norm(n.textContent));
+            for(const a of ['alt','title','aria-label','value']){const v=el.getAttribute&&el.getAttribute(a);if(v) vals.push(norm(v));}
+            for(const t of vals){
+              if(t==='○'||t==='〇'||t==='△'||t.includes('空席あり')||t.includes('残りわずか')) pos.push(t);
+              if(t.includes('満席')||t.includes('選択不可')) neg=true;
+              if(t==='×'||t==='✕'||t==='✖') x++;
+            }
+          }
+          const body=norm(document.body.innerText||document.body.textContent||'');
+          if(body.includes('この経路は選択できません')||body.includes('選択不可')) neg=true;
+          return {positive:[...new Set(pos)].slice(0,20), xCount:x, negative:neg};
+        }
+        """
+    )
+
+
+def positive_details(a: dict) -> str:
+    return " / ".join(a.get("positive") or [])
+
+
+def definitely_no_space(page, a: dict) -> bool:
+    if a.get("positive"):
+        return False
+    if a.get("negative"):
+        return True
+    body = norm(page.locator("body").inner_text(timeout=10000))
+    return ("サンライズ" in body and int(a.get("xCount", 0)) > 0)
+
+
+def click_change_and_later(page) -> None:
+    click_text(page, "この列車を変更")
+    page.wait_for_timeout(700)
+    click_text(page, "後の列車")
+    page.wait_for_timeout(1500)
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=20000)
+    except Exception:
+        pass
+    if is_guide_or_error(page):
+        raise TemporaryPageError("後の列車でご案内/エラー")
+
+
+def expand_three_plus(page) -> int:
+    clicked = 0
+    for _ in range(3):
+        els = page.locator('button:visible,a:visible,input[type="button"]:visible,input[type="submit"]:visible')
+        choice = None
+        for i in range(els.count()):
+            el = els.nth(i)
+            info = el.evaluate(
+                """
+                el=>{const n=s=>(s||'').replace(/\s+/g,' ').trim();let p=el,s='';for(let i=0;i<5&&p;i++,p=p.parentElement)s+=' '+n(p.innerText||p.textContent);const r=el.getBoundingClientRect();return{label:n(el.innerText||el.value||el.getAttribute('aria-label')||el.getAttribute('title')||''),context:n(s).slice(0,900),y:Math.round(r.y)}}
+                """
+            )
+            lab, ctx = info["label"], info["context"]
+            is_plus = lab in {"+", "＋"} or "開く" in lab or "展開" in lab or "詳細" in lab
+            if not is_plus:
+                continue
+            if re.search(r"検索条件|ご案内|凡例|記号の説明", ctx):
+                continue
+            if not re.search(r"サンライズ|特急|発|着|\d{1,2}:\d{2}", ctx):
+                continue
+            choice = el
+            break
+        if choice is None:
+            break
+        choice.click()
+        clicked += 1
+        page.wait_for_timeout(500)
+    return clicked
+
+
+def perform_check(page) -> tuple[bool, str]:
+    goto_entry(page)
+    fill_search_form(page)
+    submit_search(page)
+
+    first = scan_availability(page)
+    print(f"  -> 初回: positive={len(first['positive'])}, x={first['xCount']}, negative={first['negative']}", flush=True)
+    if first["positive"]:
+        return True, f"初回検索: {positive_details(first)}"
+    if not definitely_no_space(page, first):
+        raise TemporaryPageError("初回結果を空席あり/なしに確定できない")
+
+    print("  -> 初回は空席なし。後の列車へ", flush=True)
+    click_change_and_later(page)
+    opened = expand_three_plus(page)
+    print(f"  -> 後の列車: ＋を{opened}個展開", flush=True)
+
+    later = scan_availability(page)
+    print(f"  -> 後の列車: positive={len(later['positive'])}, x={later['xCount']}, negative={later['negative']}", flush=True)
+    if later["positive"]:
+        return True, f"後の列車（＋{opened}個）: {positive_details(later)}"
+    return False, f"初回×、後の列車＋{opened}個を確認、○/△なし"
 
 
 def run_once() -> int:
     if in_maintenance():
-        print(
-            f"[{now_text()}] 01:30-05:30 JST は"
-            "メンテナンス時間のため確認しません。"
-        )
+        print(f"[{now_text()}] 01:30-05:30 JST は監視停止。e5489にはアクセスしません。", flush=True)
         return 0
 
-    targets = build_targets()
-    groups = group_targets_by_url(targets)
     state = load_state()
-
-    checked = 0
-    unavailable = 0
-    actual_page_access_groups = 0
+    was_notified = bool(state.get("ntfy_notified", False))
+    available = None
+    details = ""
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
-        context = browser.new_context(
-            locale="ja-JP",
-            timezone_id="Asia/Tokyo",
-        )
+        context = browser.new_context(locale="ja-JP", timezone_id="Asia/Tokyo", viewport={"width":1280,"height":1800})
         page = context.new_page()
-
         try:
-            for group_index, group in enumerate(groups):
-                names = " / ".join(t["name"] for t in group)
-
-                print(
-                    f"[{now_text()}] CHECK: {names}",
-                    flush=True,
-                )
-
-                actual_page_access_groups += 1
-                group_results = check_url_group_with_retry(
-                    page,
-                    group,
-                )
-
-                for target in group:
-                    name = target["name"]
-                    url = target["url"]
-                    statuses = group_results[name]
-
-                    if statuses is None:
-                        unavailable += 1
-                        continue
-
-                    checked += 1
-                    available = is_available(statuses)
-                    status_text = format_statuses(statuses)
-
-                    print(
-                        f"  -> {name}: {status_text}",
-                        flush=True,
-                    )
-
-                    entry = state.setdefault(name, {})
-                    was_notified = bool(
-                        entry.get("ntfy_notified", False)
-                    )
-
-                    if available:
-                        if not was_notified:
-                            try:
-                                send_ntfy(
-                                    name,
-                                    statuses,
-                                    url,
-                                )
-                                print(
-                                    f"  -> {name}: ntfy通知送信",
-                                    flush=True,
-                                )
-                                entry["ntfy_notified"] = True
-                            except Exception as exc:
-                                print(
-                                    f"  -> {name}: ntfy送信失敗 "
-                                    f"({type(exc).__name__})。"
-                                    "次回再試行します。",
-                                    file=sys.stderr,
-                                    flush=True,
-                                )
-                                entry["ntfy_notified"] = False
-                    else:
-                        entry["ntfy_notified"] = False
-
-                    entry["available"] = available
-                    entry["statuses"] = statuses
-                    entry["last_checked"] = now_text()
-                    save_state(state)
-
-                if group_index < len(groups) - 1:
-                    time.sleep(2)
-
+            for attempt in range(1, MAX_ATTEMPTS + 1):
+                try:
+                    print(f"[{now_text()}] CHECK {attempt}/{MAX_ATTEMPTS}", flush=True)
+                    available, details = perform_check(page)
+                    break
+                except Exception as exc:
+                    print(f"  -> 確認不能: {type(exc).__name__}: {exc}; {page_diag(page)}", file=sys.stderr, flush=True)
+                    if attempt < MAX_ATTEMPTS:
+                        print(f"  -> {RETRY_WAIT_SECONDS}秒後に巡回全体を再試行", flush=True)
+                        time.sleep(RETRY_WAIT_SECONDS)
         finally:
-            page.close()
-            context.close()
-            browser.close()
+            page.close(); context.close(); browser.close()
 
-    print(
-        f"[{now_text()}] SUMMARY: "
-        f"確認成功={checked}, "
-        f"今回確認不能={unavailable}, "
-        f"URLグループ={actual_page_access_groups}",
-        flush=True,
-    )
+    if available is None:
+        print(f"[{now_text()}] SUMMARY: 今回確認不能。状態は変更しません。", flush=True)
+        return 0
 
+    if available:
+        print(f"[{now_text()}] 空席検出: {details}", flush=True)
+        if not was_notified:
+            try:
+                stage = "後の列車で空席を検出" if details.startswith("後の列車") else "最初の検索結果で空席を検出"
+                send_ntfy(stage, details)
+                print("  -> ntfy通知送信", flush=True)
+                state["ntfy_notified"] = True
+            except Exception as exc:
+                print(f"  -> ntfy送信失敗 ({type(exc).__name__})。次回再送します。", file=sys.stderr, flush=True)
+                state["ntfy_notified"] = False
+    else:
+        print(f"[{now_text()}] 空席なし: {details}", flush=True)
+        state["ntfy_notified"] = False
+
+    state["available"] = available
+    state["details"] = details
+    state["last_checked"] = now_text()
+    save_state(state)
+    print(f"[{now_text()}] SUMMARY: available={available}, notified={state.get('ntfy_notified', False)}", flush=True)
     return 0
 
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument(
-        "--test-ntfy",
-        action="store_true",
-    )
-    return p.parse_args()
-
-
 def main() -> int:
-    args = parse_args()
-
+    p = argparse.ArgumentParser()
+    p.add_argument("--test-ntfy", action="store_true")
+    args = p.parse_args()
     if args.test_ntfy:
-        send_test_ntfy()
-        print("ntfyテスト通知を送信しました。")
-        return 0
-
+        send_test_ntfy(); print("ntfyテスト通知を送信しました。"); return 0
     return run_once()
 
 
