@@ -21,6 +21,15 @@ MAINTENANCE_END = dt_time(5, 30)
 STATE_FILE = Path(os.getenv("STATE_FILE", ".state/sunrise_state.json"))
 AVAILABLE_MARKS = {"○", "△", "あり"}
 
+# e5489が一時的に「ご案内」等を返す場合に備え、同じ対象を少し待って再確認。
+MAX_ATTEMPTS = 2
+RETRY_WAIT_SECONDS = 15
+
+
+class TemporaryCheckError(RuntimeError):
+    """一時的なページ取得/判定不能。Secret URLを例外文に含めない。"""
+    pass
+
 
 def require_env(name: str) -> str:
     value = os.getenv(name, "").strip()
@@ -235,6 +244,30 @@ def build_targets() -> list[dict[str, str]]:
     ]
 
 
+def page_diagnostic(page) -> str:
+    """
+    Public Actionsログに出してよい最小限の診断情報。
+    URL・本文・旅行条件は出さない。
+    """
+    try:
+        title = page.title()
+    except Exception:
+        title = "(取得不能)"
+
+    try:
+        body = normalize_text(page.locator("body").inner_text(timeout=5_000))
+    except Exception:
+        body = ""
+
+    return (
+        f"title={title!r}, "
+        f"result_page={'経路・設備選択' in title}, "
+        f"sunrise={'サンライズ' in body}, "
+        f"A寝台={'A寝台' in body}, "
+        f"B寝台={'B寝台' in body}"
+    )
+
+
 def validate_page(page) -> None:
     body = normalize_text(page.locator("body").inner_text(timeout=10_000))
     title = page.title()
@@ -248,28 +281,96 @@ def validate_page(page) -> None:
         "しばらく時間をおいて",
     )
 
-    if "ご案内" in title and any(p in body for p in congestion_phrases):
-        raise RuntimeError("e5489が混雑・案内ページを返しました")
+    # 「ご案内」は一時的に返ることがあるので、即座に恒久エラーとはみなさない。
+    if "ご案内" in title:
+        if any(p in body for p in congestion_phrases):
+            raise TemporaryCheckError("一時的な混雑・案内ページ")
+        raise TemporaryCheckError("一時的なご案内ページ")
 
     if "入力・選択しなおしてください" in body:
-        raise RuntimeError("e5489から入力・選択しなおしの案内が返りました")
+        raise TemporaryCheckError("入力・選択しなおしページ")
 
     if "メンテナンス" in body and "経路・設備選択" not in title:
-        raise RuntimeError("e5489のメンテナンス案内が返りました")
+        raise TemporaryCheckError("メンテナンス案内ページ")
 
-    # 正常タイトルを優先。タイトルが変わった場合は本文のサンライズでも確認する。
     if "経路・設備選択" not in title and "サンライズ" not in body:
-        raise RuntimeError(f"検索結果ページを確認できませんでした (title={title!r})")
+        raise TemporaryCheckError("検索結果ページを確認できない")
+
+
+def load_target_page_with_retry(page, target: dict) -> dict[str, str] | None:
+    """
+    最大2回まで確認。
+    1回目がご案内/行取得不能でも15秒待って再試行する。
+    2回とも確認不能ならNoneを返し、次の5分巡回に任せる。
+    """
+    name = target["name"]
+    url = target["url"]
+    equipment = target["equipment"]
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            try:
+                page.goto(
+                    url,
+                    wait_until="domcontentloaded",
+                    timeout=45_000,
+                )
+            except Exception as exc:
+                # Playwrightの元例外文にはSecret URLが入る可能性があるので表示しない。
+                raise TemporaryCheckError(
+                    f"ページ取得失敗 ({type(exc).__name__})"
+                ) from None
+
+            page.wait_for_timeout(1200)
+            validate_page(page)
+
+            try:
+                statuses = extract_equipment_status(page, equipment)
+            except Exception:
+                raise TemporaryCheckError(
+                    f"{equipment} の空席欄を取得できない"
+                ) from None
+
+            if attempt > 1:
+                print(f"  -> 再試行 {attempt} 回目で確認成功", flush=True)
+
+            return statuses
+
+        except TemporaryCheckError as exc:
+            print(
+                f"  -> 確認不能 {attempt}/{MAX_ATTEMPTS}: {exc}; "
+                f"{page_diagnostic(page)}",
+                flush=True,
+            )
+
+            if attempt < MAX_ATTEMPTS:
+                print(
+                    f"  -> {RETRY_WAIT_SECONDS}秒待って再試行します",
+                    flush=True,
+                )
+                time.sleep(RETRY_WAIT_SECONDS)
+
+    print(
+        "  -> 今回は確認できませんでした。空席状態は変更せず、"
+        "次回の定期実行で再確認します。",
+        flush=True,
+    )
+    return None
 
 
 def run_once() -> int:
     # workflow_dispatchをメンテ時間に押してもe5489へはアクセスしない。
     if in_maintenance():
-        print(f"[{now_text()}] 01:30-05:30 JST はメンテナンス時間のため確認しません。")
+        print(
+            f"[{now_text()}] 01:30-05:30 JST はメンテナンス時間のため確認しません。"
+        )
         return 0
 
     targets = build_targets()
     state = load_state()
+
+    checked = 0
+    unavailable_to_check = 0
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
@@ -279,10 +380,8 @@ def run_once() -> int:
         )
         page = context.new_page()
 
-        # 同じURLは1回の実行中に再アクセスしない。
-        loaded_url: str | None = None
-        loaded_ok = False
-
+        # 同じURLの2対象（デラックス/シングルツイン）でも、
+        # A寝台/B寝台を確実に判定するため対象ごとに確認する。
         try:
             for index, target in enumerate(targets):
                 name = target["name"]
@@ -290,22 +389,11 @@ def run_once() -> int:
 
                 print(f"[{now_text()}] CHECK: {name}", flush=True)
 
-                try:
-                    if loaded_url != url or not loaded_ok:
-                        page.goto(
-                            url,
-                            wait_until="domcontentloaded",
-                            timeout=45_000,
-                        )
-                        page.wait_for_timeout(1200)
-                        validate_page(page)
-                        loaded_url = url
-                        loaded_ok = True
-
-                    statuses = extract_equipment_status(
-                        page,
-                        target["equipment"],
-                    )
+                statuses = load_target_page_with_retry(page, target)
+                if statuses is None:
+                    unavailable_to_check += 1
+                else:
+                    checked += 1
                     available = is_available(statuses)
                     status_text = format_statuses(statuses)
                     print(f"  -> {status_text}", flush=True)
@@ -315,9 +403,19 @@ def run_once() -> int:
 
                     if available:
                         if not was_notified:
-                            send_ntfy(name, statuses, url)
-                            print("  -> ntfy通知送信", flush=True)
-                            entry["ntfy_notified"] = True
+                            try:
+                                send_ntfy(name, statuses, url)
+                                print("  -> ntfy通知送信", flush=True)
+                                entry["ntfy_notified"] = True
+                            except Exception as exc:
+                                # ntfy URL等をPublicログに出さない。
+                                print(
+                                    f"  -> ntfy送信失敗 ({type(exc).__name__})。"
+                                    "次回再試行します。",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                                entry["ntfy_notified"] = False
                     else:
                         # ×へ戻ったら、次の空席発生時に再通知できるようリセット。
                         entry["ntfy_notified"] = False
@@ -327,27 +425,22 @@ def run_once() -> int:
                     entry["last_checked"] = now_text()
                     save_state(state)
 
-                except Exception as exc:
-                    # URLやSecretの値はログに出さない。
-                    print(
-                        f"[{now_text()}] ERROR [{name}]: "
-                        f"{type(exc).__name__}: {exc}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    loaded_url = None
-                    loaded_ok = False
-
                 if index < len(targets) - 1:
-                    next_url = targets[index + 1]["url"]
-                    if next_url != url:
-                        time.sleep(2)
+                    time.sleep(2)
 
         finally:
             page.close()
             context.close()
             browser.close()
 
+    print(
+        f"[{now_text()}] SUMMARY: 確認成功={checked}, "
+        f"今回確認不能={unavailable_to_check}",
+        flush=True,
+    )
+
+    # 一時的な確認不能はAction自体をFailureにしない。
+    # 5分後の次回スケジュールで再試行する。
     return 0
 
 
