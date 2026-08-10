@@ -1,0 +1,102 @@
+name: Sunrise Izumo Watch
+
+on:
+  # 5分間隔。ただし 01:30-05:30 JST は schedule 自体を作らない。
+  # 毎時00分の混雑を少し避けるため、02,07,12...57分にずらしている。
+  schedule:
+    - cron: '32,37,42,47,52,57 5 * * *'
+      timezone: 'Asia/Tokyo'
+    - cron: '2,7,12,17,22,27,32,37,42,47,52,57 6-23 * * *'
+      timezone: 'Asia/Tokyo'
+    - cron: '2,7,12,17,22,27,32,37,42,47,52,57 0 * * *'
+      timezone: 'Asia/Tokyo'
+    - cron: '2,7,12,17,22,27 1 * * *'
+      timezone: 'Asia/Tokyo'
+
+  # 手動テスト用。pull_request / pull_request_target / push は定義しない。
+  workflow_dispatch:
+    inputs:
+      test_ntfy:
+        description: 'e5489を見ずにntfyだけテストする'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sunrise-izumo-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      NTFY_TOPIC_URL: ${{ secrets.NTFY_TOPIC_URL }}
+      TRIP_LABEL: ${{ secrets.TRIP_LABEL }}
+      URL_SINGLE_DELUXE: ${{ secrets.URL_SINGLE_DELUXE }}
+      URL_SINGLE_TWIN: ${{ secrets.URL_SINGLE_TWIN }}
+      URL_SINGLE: ${{ secrets.URL_SINGLE }}
+      URL_SOLO: ${{ secrets.URL_SOLO }}
+      URL_SUNRISE_TWIN: ${{ secrets.URL_SUNRISE_TWIN }}
+      STATE_FILE: .state/sunrise_state.json
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Restore Playwright browser cache
+        id: playwright-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Restore monitor state
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: sunrise-state-${{ github.run_id }}
+          restore-keys: |
+            sunrise-state-
+
+      - name: Install Python package
+        run: python -m pip install -r requirements.txt
+
+      - name: Install Chromium OS dependencies
+        run: python -m playwright install-deps chromium
+
+      - name: Install Chromium
+        run: python -m playwright install chromium
+
+      - name: Save Playwright browser cache
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Run ntfy test
+        if: github.event_name == 'workflow_dispatch' && inputs.test_ntfy == true
+        run: python sunrise_watch_actions.py --test-ntfy
+
+      - name: Check e5489 once
+        if: github.event_name != 'workflow_dispatch' || inputs.test_ntfy != true
+        run: python sunrise_watch_actions.py
+
+      # stateには空席通知済みかどうかだけを保存。URLやntfyトピックは入らない。
+      - name: Save monitor state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: sunrise-state-${{ github.run_id }}
