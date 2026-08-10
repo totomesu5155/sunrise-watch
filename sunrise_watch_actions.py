@@ -444,12 +444,26 @@ def validate_page(page) -> None:
         raise TemporaryCheckError("検索結果ページを確認できない")
 
 
-def load_target_page_with_retry(
+def check_url_group_with_retry(
     page,
-    target: dict,
-) -> dict[str, str] | None:
-    url = target["url"]
-    equipment = target["equipment"]
+    group: list[dict[str, str]],
+) -> dict[str, dict[str, str] | None]:
+    """
+    同じURLを共有する対象は1回のページ取得でまとめて判定する。
+
+    例:
+      シングルデラックス(A寝台)
+      シングルツイン(B寝台)
+    は同じURLなので、正常ページを1回取得して両方読む。
+
+    一時的な「ご案内」やDOM読取失敗時のみ最大2回まで再取得する。
+    """
+    url = group[0]["url"]
+    results: dict[str, dict[str, str] | None] = {
+        target["name"]: None for target in group
+    }
+
+    unresolved = {target["name"] for target in group}
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
@@ -467,44 +481,84 @@ def load_target_page_with_retry(
             page.wait_for_timeout(1200)
             validate_page(page)
 
-            try:
-                statuses = extract_equipment_status(
-                    page,
-                    equipment,
-                )
-            except Exception:
-                raise TemporaryCheckError(
-                    f"{equipment} の空席状態を取得できない"
-                ) from None
-
-            if attempt > 1:
-                print(
-                    f"  -> 再試行 {attempt} 回目で確認成功",
-                    flush=True,
-                )
-
-            return statuses
-
         except TemporaryCheckError as exc:
             print(
-                f"  -> 確認不能 {attempt}/{MAX_ATTEMPTS}: "
+                f"  -> ページ確認不能 {attempt}/{MAX_ATTEMPTS}: "
                 f"{exc}; {page_diagnostic(page)}",
                 flush=True,
             )
 
             if attempt < MAX_ATTEMPTS:
                 print(
-                    f"  -> {RETRY_WAIT_SECONDS}秒待って再試行します",
+                    f"  -> {RETRY_WAIT_SECONDS}秒待って同じURLを再試行します",
                     flush=True,
                 )
                 time.sleep(RETRY_WAIT_SECONDS)
+                continue
+            break
 
-    print(
-        "  -> 今回は確認できませんでした。"
-        "空席状態は変更せず、次回の定期実行で再確認します。",
-        flush=True,
-    )
-    return None
+        # ページが正常なら、同じページから未解決の設備をまとめて読む。
+        for target in group:
+            name = target["name"]
+            if name not in unresolved:
+                continue
+
+            equipment = target["equipment"]
+            try:
+                statuses = extract_equipment_status(page, equipment)
+                results[name] = statuses
+                unresolved.discard(name)
+
+                if attempt > 1:
+                    print(
+                        f"  -> {name}: 再試行 {attempt} 回目で確認成功",
+                        flush=True,
+                    )
+
+            except Exception:
+                print(
+                    f"  -> {name}: {equipment} の空席状態を取得できない "
+                    f"({attempt}/{MAX_ATTEMPTS}); {page_diagnostic(page)}",
+                    flush=True,
+                )
+
+        if not unresolved:
+            break
+
+        if attempt < MAX_ATTEMPTS:
+            print(
+                f"  -> 未確認 {len(unresolved)}件のため "
+                f"{RETRY_WAIT_SECONDS}秒待って同じURLを再取得します",
+                flush=True,
+            )
+            time.sleep(RETRY_WAIT_SECONDS)
+
+    for name in sorted(unresolved):
+        print(
+            f"  -> {name}: 今回は確認できませんでした。"
+            "空席状態は変更せず、次回の定期実行で再確認します。",
+            flush=True,
+        )
+
+    return results
+
+
+def group_targets_by_url(
+    targets: list[dict[str, str]],
+) -> list[list[dict[str, str]]]:
+    """元の表示順を保ったまま、同じURLの対象を1グループにまとめる。"""
+    groups: list[list[dict[str, str]]] = []
+    index_by_url: dict[str, int] = {}
+
+    for target in targets:
+        url = target["url"]
+        if url in index_by_url:
+            groups[index_by_url[url]].append(target)
+        else:
+            index_by_url[url] = len(groups)
+            groups.append([target])
+
+    return groups
 
 
 def run_once() -> int:
@@ -516,10 +570,12 @@ def run_once() -> int:
         return 0
 
     targets = build_targets()
+    groups = group_targets_by_url(targets)
     state = load_state()
 
     checked = 0
     unavailable = 0
+    actual_page_access_groups = 0
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
@@ -530,29 +586,35 @@ def run_once() -> int:
         page = context.new_page()
 
         try:
-            for index, target in enumerate(targets):
-                name = target["name"]
-                url = target["url"]
+            for group_index, group in enumerate(groups):
+                names = " / ".join(t["name"] for t in group)
 
                 print(
-                    f"[{now_text()}] CHECK: {name}",
+                    f"[{now_text()}] CHECK: {names}",
                     flush=True,
                 )
 
-                statuses = load_target_page_with_retry(
+                actual_page_access_groups += 1
+                group_results = check_url_group_with_retry(
                     page,
-                    target,
+                    group,
                 )
 
-                if statuses is None:
-                    unavailable += 1
-                else:
+                for target in group:
+                    name = target["name"]
+                    url = target["url"]
+                    statuses = group_results[name]
+
+                    if statuses is None:
+                        unavailable += 1
+                        continue
+
                     checked += 1
                     available = is_available(statuses)
                     status_text = format_statuses(statuses)
 
                     print(
-                        f"  -> {status_text}",
+                        f"  -> {name}: {status_text}",
                         flush=True,
                     )
 
@@ -570,13 +632,13 @@ def run_once() -> int:
                                     url,
                                 )
                                 print(
-                                    "  -> ntfy通知送信",
+                                    f"  -> {name}: ntfy通知送信",
                                     flush=True,
                                 )
                                 entry["ntfy_notified"] = True
                             except Exception as exc:
                                 print(
-                                    "  -> ntfy送信失敗 "
+                                    f"  -> {name}: ntfy送信失敗 "
                                     f"({type(exc).__name__})。"
                                     "次回再試行します。",
                                     file=sys.stderr,
@@ -591,7 +653,7 @@ def run_once() -> int:
                     entry["last_checked"] = now_text()
                     save_state(state)
 
-                if index < len(targets) - 1:
+                if group_index < len(groups) - 1:
                     time.sleep(2)
 
         finally:
@@ -602,7 +664,8 @@ def run_once() -> int:
     print(
         f"[{now_text()}] SUMMARY: "
         f"確認成功={checked}, "
-        f"今回確認不能={unavailable}",
+        f"今回確認不能={unavailable}, "
+        f"URLグループ={actual_page_access_groups}",
         flush=True,
     )
 
