@@ -16,11 +16,11 @@ from playwright.sync_api import sync_playwright
 
 JST = ZoneInfo("Asia/Tokyo")
 
-# JR蛛ｴ縺ｫ繧｢繧ｯ繧ｻ繧ｹ縺励↑縺�凾髢�
+# JR側にアクセスしない時間
 MAINTENANCE_START = dt_time(1, 30)
 MAINTENANCE_END = dt_time(5, 30)
 
-# 蠢�★繝医ャ繝礼判髱｢縺九ｉ蜈･繧翫√梧眠隕丈ｺ育ｴ�阪ｒ謚ｼ縺�
+# 必ずトップ画面から入り、「新規予約」を押す
 TOP_URL = "https://e5489.jr-odekake.net/e5489/cssp/CBTopMenuSP"
 
 STATE_FILE = Path(os.getenv("STATE_FILE", ".state/sunrise_state.json"))
@@ -28,12 +28,926 @@ STATE_FILE = Path(os.getenv("STATE_FILE", ".state/sunrise_state.json"))
 MAX_ATTEMPTS = 2
 RETRY_WAIT_SECONDS = 15
 
-POSITIVE_ALTS = {"遨ｺ蟶ｭ縺ゅｊ", "遨ｺ蟶ｭ谿九ｊ繧上★縺�"}
-NEGATIVE_ALT = "谿句ｸｭ縺ｪ縺�"
+POSITIVE_ALTS = {"空席あり", "空席残りわずか"}
+NEGATIVE_ALT = "残席なし"
 
 
 class TemporaryPageError(RuntimeError):
     pass
+
+
+def require_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"GitHub Secret が未設定です: {name}")
+    return value
+
+
+def now_jst() -> datetime:
+    return datetime.now(JST)
+
+
+def now_text() -> str:
+    return now_jst().strftime("%Y-%m-%d %H:%M:%S JST")
+
+
+def in_maintenance() -> bool:
+    t = now_jst().time().replace(tzinfo=None)
+    return MAINTENANCE_START <= t < MAINTENANCE_END
+
+
+def norm(s: str | None) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+def current_path(page) -> str:
+    try:
+        return urllib.parse.urlsplit(page.url).path
+    except Exception:
+        return ""
+
+
+def page_diag(page) -> str:
+    try:
+        title = page.title()
+        body = norm(page.locator("body").inner_text(timeout=5000))
+    except Exception:
+        return "page=unreadable"
+
+    return (
+        f"title={title!r}, path={current_path(page)!r}, "
+        f"top={'トップメニュー' in title or 'トップメニュー' in body}, "
+        f"entry={'日時・発着駅選択' in title or '日時・発着駅選択' in body}, "
+        f"route={'経路・設備選択' in title or '経路・設備選択' in body}, "
+        f"change={'列車の変更' in title or '列車の変更' in body}"
+    )
+
+
+def is_guide_or_error(page) -> bool:
+    title = page.title()
+    body = norm(page.locator("body").inner_text(timeout=10000))
+    return (
+        "ご案内" in title
+        or "処理中にエラーが発生しました" in body
+        or "入力・選択しなおしてください" in body
+        or "アクセスが集中" in body
+        or "大変混み合" in body
+    )
+
+
+# ------------------------------------------------------------
+# 状態保存
+# ------------------------------------------------------------
+
+def load_state() -> dict:
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_state(state: dict) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tmp.replace(STATE_FILE)
+
+
+# ------------------------------------------------------------
+# ntfy
+# ------------------------------------------------------------
+
+def ntfy_root_topic() -> tuple[str, str]:
+    url = require_env("NTFY_TOPIC_URL")
+    p = urllib.parse.urlsplit(url)
+    topic = urllib.parse.unquote(p.path.strip("/"))
+
+    if not p.scheme or not p.netloc or not topic:
+        raise RuntimeError("NTFY_TOPIC_URL の形式が不正です")
+
+    root = urllib.parse.urlunsplit(
+        (p.scheme, p.netloc, "/", "", "")
+    )
+    return root, topic
+
+
+def publish_ntfy(payload: dict) -> None:
+    root, topic = ntfy_root_topic()
+    body = dict(payload)
+    body["topic"] = topic
+
+    req = urllib.request.Request(
+        root,
+        data=json.dumps(
+            body,
+            ensure_ascii=False,
+        ).encode("utf-8"),
+        method="POST",
+        headers={
+            "Content-Type": "application/json; charset=utf-8"
+        },
+    )
+
+    with urllib.request.urlopen(req, timeout=30) as response:
+        if response.status >= 400:
+            raise RuntimeError(
+                f"ntfy HTTP {response.status}"
+            )
+
+
+def send_ntfy(stage: str, details: str) -> None:
+    publish_ntfy({
+        "title": "サンライズ出雲 空席あり",
+        "message": (
+            f"{require_env('TRIP_LABEL')}\n"
+            f"{stage}\n"
+            f"{details}\n"
+            "e5489を確認してください。"
+        ),
+        "priority": 5,
+        "tags": ["rotating_light", "train"],
+        "click": TOP_URL,
+    })
+
+
+def send_test_ntfy() -> None:
+    publish_ntfy({
+        "title": "サンライズ監視 GitHub Actions テスト",
+        "message": "新規予約ボタン経由版のntfyテスト通知です。",
+        "priority": 4,
+    })
+
+
+# ------------------------------------------------------------
+# 1. トップ → 新規予約
+# ------------------------------------------------------------
+
+def open_top_and_click_new_reservation(page) -> None:
+    page.goto(
+        TOP_URL,
+        wait_until="domcontentloaded",
+        timeout=45000,
+    )
+    page.wait_for_timeout(1200)
+
+    if is_guide_or_error(page):
+        raise TemporaryPageError(
+            "e5489トップがご案内/エラー"
+        )
+
+    # 添付された実ページでは、
+    # <p class="new-home-index-navigation__ttl">新規予約</p>
+    # を含む<a>が新規予約ボタン。
+    new_text = page.get_by_text(
+        "新規予約",
+        exact=True,
+    )
+
+    clicked = False
+
+    if new_text.count() > 0:
+        try:
+            anchor = new_text.first.locator(
+                "xpath=ancestor::a[1]"
+            )
+            if anchor.count() > 0:
+                anchor.click()
+            else:
+                new_text.first.click()
+
+            clicked = True
+            print(
+                "  -> トップ画面の「新規予約」をクリック",
+                flush=True,
+            )
+        except Exception:
+            clicked = False
+
+    # サイト側JSのクリック処理が取れない場合だけ、
+    # 添付HTMLで確認できた formTrainSimpleEntry をPOSTする。
+    # 内部URLへのGET直リンクはしない。
+    if not clicked:
+        form = page.locator(
+            'form[name="formTrainSimpleEntry"]'
+        )
+
+        if form.count() == 0:
+            raise TemporaryPageError(
+                "トップ画面に新規予約ボタン/フォームが見つからない"
+            )
+
+        form.evaluate(
+            "form => form.submit()"
+        )
+        print(
+            "  -> 新規予約フォームをPOST送信",
+            flush=True,
+        )
+
+    page.wait_for_timeout(1500)
+
+    try:
+        page.wait_for_load_state(
+            "domcontentloaded",
+            timeout=20000,
+        )
+    except Exception:
+        pass
+
+    if is_guide_or_error(page):
+        raise TemporaryPageError(
+            "新規予約を押した後にご案内/エラー"
+        )
+
+    print(
+        f"  -> 新規予約遷移先: {current_path(page)}",
+        flush=True,
+    )
+
+
+# ------------------------------------------------------------
+# 2. CBTrainSimpleEntrySP → 「駅名を入力」タブ
+# ------------------------------------------------------------
+
+def move_to_station_name_entry(page) -> None:
+    # すでにCBTrainEntrySPなら何もしない
+    if (
+        page.locator(
+            "#entry-departure-station"
+        ).count() > 0
+        and page.locator(
+            "#entry-arrival-station"
+        ).count() > 0
+    ):
+        return
+
+    # SimpleEntry画面で「駅名を入力」タブを押す
+    tab = page.get_by_text(
+        "駅名を入力",
+        exact=True,
+    )
+
+    if tab.count() == 0:
+        raise TemporaryPageError(
+            "「駅名を入力」タブが見つからない"
+        )
+
+    tab.first.click()
+
+    page.wait_for_timeout(1200)
+
+    try:
+        page.wait_for_load_state(
+            "domcontentloaded",
+            timeout=15000,
+        )
+    except Exception:
+        pass
+
+    if is_guide_or_error(page):
+        raise TemporaryPageError(
+            "「駅名を入力」タブ遷移後にご案内/エラー"
+        )
+
+    if (
+        page.locator(
+            "#entry-departure-station"
+        ).count() == 0
+        or page.locator(
+            "#entry-arrival-station"
+        ).count() == 0
+    ):
+        raise TemporaryPageError(
+            "日時・発着駅選択画面を確認できない"
+        )
+
+    print(
+        f"  -> 「駅名を入力」へ移動: {current_path(page)}",
+        flush=True,
+    )
+
+
+# ------------------------------------------------------------
+# 3. 検索条件
+# 添付HTMLからname/id/valueを固定
+# ------------------------------------------------------------
+
+def fill_search_conditions(page) -> None:
+    depart = require_env("DEPART_STATION")
+    arrive = require_env("ARRIVE_STATION")
+    travel_date = require_env("TRAVEL_DATE").replace(
+        "-", ""
+    )
+    hour = require_env("DEPART_HOUR").zfill(2)
+    minute = require_env(
+        "DEPART_MINUTE"
+    ).zfill(2)
+
+    page.locator(
+        "#entry-departure-station"
+    ).fill(depart)
+
+    page.locator(
+        "#entry-arrival-station"
+    ).fill(arrive)
+
+    page.locator(
+        'select[name="inputDate"]'
+    ).select_option(value=travel_date)
+
+    page.locator(
+        'select[name="inputHour"]'
+    ).select_option(value=hour)
+
+    page.locator(
+        'select[name="inputMinute"]'
+    ).select_option(value=minute)
+
+    # 出発
+    page.locator(
+        'input[name="inputType"][value="0"]'
+    ).check()
+
+    # 一度も乗り換えしない
+    page.locator(
+        'input[name="inputSearchType"][value="1"]'
+    ).check()
+
+    # 新幹線OFF
+    shinkansen = page.locator(
+        "#reserrve-shinkansen"
+    )
+    if shinkansen.is_checked():
+        shinkansen.uncheck()
+
+    # 特急・急行／快速ON
+    limited = page.locator(
+        "#reserrve-not-shinkansen"
+    )
+    if not limited.is_checked():
+        limited.check()
+
+    print(
+        "  -> 東京→出雲市 / 9月3日 / "
+        "21:10 / 乗換なし / 新幹線OFF",
+        flush=True,
+    )
+
+
+def submit_search(page) -> None:
+    button = page.locator(
+        "button.decide-button"
+    )
+
+    if button.count() == 0:
+        # 表示文字でもフォールバック
+        button = page.get_by_text(
+            "検索する",
+            exact=False,
+        )
+
+    if button.count() == 0:
+        raise TemporaryPageError(
+            "「検索する（新規予約）」ボタンが見つからない"
+        )
+
+    button.first.click()
+
+    page.wait_for_timeout(1800)
+
+    try:
+        page.wait_for_load_state(
+            "domcontentloaded",
+            timeout=20000,
+        )
+    except Exception:
+        pass
+
+    if is_guide_or_error(page):
+        raise TemporaryPageError(
+            "検索後にご案内/エラー"
+        )
+
+    if page.locator(
+        "table.seat-status-table"
+    ).count() == 0:
+        raise TemporaryPageError(
+            "経路・設備選択の空席表が見つからない"
+        )
+
+    print(
+        f"  -> 検索結果: {current_path(page)}",
+        flush=True,
+    )
+
+
+# ------------------------------------------------------------
+# 4. 最初の経路・設備選択
+#
+# 凡例の「空席あり」「残席なし」を誤検出しないよう
+# table.seat-status-table 内だけを読む。
+# ------------------------------------------------------------
+
+def read_initial_route_status(page) -> dict:
+    table = page.locator(
+        "table.seat-status-table"
+    ).first
+
+    rows = table.locator("tr")
+    results = []
+
+    for i in range(rows.count()):
+        row = rows.nth(i)
+
+        imgs = row.locator(
+            'img[alt="空席あり"], '
+            'img[alt="空席残りわずか"], '
+            'img[alt="残席なし"]'
+        )
+
+        if imgs.count() == 0:
+            continue
+
+        label = norm(
+            row.inner_text()
+        )
+
+        alts = []
+        for j in range(imgs.count()):
+            alt = imgs.nth(j).get_attribute(
+                "alt"
+            )
+            if alt:
+                alts.append(alt)
+
+        results.append({
+            "label": label,
+            "alts": alts,
+        })
+
+    if not results:
+        raise TemporaryPageError(
+            "最初の空席状態を取得できない"
+        )
+
+    positives = []
+    total_marks = 0
+    negative_marks = 0
+
+    for item in results:
+        for alt in item["alts"]:
+            total_marks += 1
+            if alt in POSITIVE_ALTS:
+                positives.append(
+                    f"{item['label']}:{alt}"
+                )
+            elif alt == NEGATIVE_ALT:
+                negative_marks += 1
+
+    return {
+        "rows": results,
+        "positives": positives,
+        "all_negative": (
+            total_marks > 0
+            and negative_marks == total_marks
+        ),
+        "total": total_marks,
+    }
+
+
+# ------------------------------------------------------------
+# 5. 「この列車を変更」→「後の列車」
+# ------------------------------------------------------------
+
+def open_later_trains(page) -> None:
+    change = page.get_by_text(
+        "この列車を変更",
+        exact=True,
+    )
+
+    if change.count() == 0:
+        raise TemporaryPageError(
+            "「この列車を変更」が見つからない"
+        )
+
+    change.first.click()
+    page.wait_for_timeout(500)
+
+    later = page.locator(
+        "button.change-next-train-button"
+    )
+
+    if later.count() == 0:
+        later = page.get_by_text(
+            "後の列車",
+            exact=True,
+        )
+
+    if later.count() == 0:
+        raise TemporaryPageError(
+            "「後の列車」が見つからない"
+        )
+
+    later.first.click()
+
+    page.wait_for_timeout(1500)
+
+    try:
+        page.wait_for_load_state(
+            "domcontentloaded",
+            timeout=20000,
+        )
+    except Exception:
+        pass
+
+    if is_guide_or_error(page):
+        raise TemporaryPageError(
+            "後の列車へ移動後にご案内/エラー"
+        )
+
+    if page.locator(
+        'button[aria-controls="train-1"]'
+    ).count() == 0:
+        raise TemporaryPageError(
+            "列車変更画面の候補1～3を確認できない"
+        )
+
+    print(
+        f"  -> 後の列車: {current_path(page)}",
+        flush=True,
+    )
+
+
+# ------------------------------------------------------------
+# 6. train-1 / train-2 / train-3 の＋を開いて空席確認
+# ------------------------------------------------------------
+
+def candidate_name_from_li(li, fallback: str) -> str:
+    txt = norm(li.inner_text())
+
+    m = re.search(
+        r"特急サンライズ出雲（[^）]+）",
+        txt,
+    )
+
+    if m:
+        return m.group(0)
+
+    return fallback
+
+
+def read_three_later_trains(page) -> dict:
+    positives = []
+    details = []
+    checked = 0
+
+    for index in range(1, 4):
+        panel_id = f"train-{index}"
+
+        button = page.locator(
+            f'button[aria-controls="{panel_id}"]'
+        )
+
+        panel = page.locator(
+            f"#{panel_id}"
+        )
+
+        if button.count() == 0 or panel.count() == 0:
+            raise TemporaryPageError(
+                f"{panel_id} が見つからない"
+            )
+
+        # ＋（開閉する）を押す。
+        # 既に開いている場合はそのまま読む。
+        expanded = (
+            button.first.get_attribute(
+                "aria-expanded"
+            )
+            or ""
+        ).lower()
+
+        if expanded != "true":
+            button.first.click()
+            page.wait_for_timeout(350)
+
+        li = panel.first.locator(
+            "xpath=ancestor::li[1]"
+        )
+
+        if li.count() > 0:
+            name = candidate_name_from_li(
+                li.first,
+                panel_id,
+            )
+        else:
+            name = panel_id
+
+        imgs = panel.first.locator(
+            'img[alt="空席あり"], '
+            'img[alt="空席残りわずか"], '
+            'img[alt="残席なし"]'
+        )
+
+        if imgs.count() == 0:
+            raise TemporaryPageError(
+                f"{name} の空席画像を取得できない"
+            )
+
+        alts = []
+
+        for j in range(imgs.count()):
+            alt = imgs.nth(j).get_attribute(
+                "alt"
+            )
+            if alt:
+                alts.append(alt)
+
+        checked += 1
+        details.append(
+            f"{name}:{'/'.join(alts)}"
+        )
+
+        for alt in alts:
+            if alt in POSITIVE_ALTS:
+                positives.append(
+                    f"{name}:{alt}"
+                )
+
+        print(
+            f"  -> {name}: {' / '.join(alts)}",
+            flush=True,
+        )
+
+    return {
+        "checked": checked,
+        "details": details,
+        "positives": positives,
+    }
+
+
+# ------------------------------------------------------------
+# 1巡回
+# ------------------------------------------------------------
+
+def perform_check(page) -> tuple[bool, str]:
+    # 必ずトップから正規遷移
+    open_top_and_click_new_reservation(page)
+
+    # SimpleEntry → 駅名入力
+    move_to_station_name_entry(page)
+
+    # 条件入力
+    fill_search_conditions(page)
+    submit_search(page)
+
+    # 最初の検索結果
+    initial = read_initial_route_status(
+        page
+    )
+
+    print(
+        f"  -> 初回空席マーク数={initial['total']}, "
+        f"空席あり={len(initial['positives'])}",
+        flush=True,
+    )
+
+    if initial["positives"]:
+        return (
+            True,
+            "初回検索: "
+            + " / ".join(
+                initial["positives"]
+            ),
+        )
+
+    if not initial["all_negative"]:
+        raise TemporaryPageError(
+            "初回結果が「すべて残席なし」ではなく、"
+            "○/△もないため判定保留"
+        )
+
+    print(
+        "  -> 初回はすべて残席なし。"
+        "「この列車を変更」→「後の列車」へ",
+        flush=True,
+    )
+
+    # 後の列車
+    open_later_trains(page)
+
+    later = read_three_later_trains(
+        page
+    )
+
+    if later["positives"]:
+        return (
+            True,
+            "後の列車: "
+            + " / ".join(
+                later["positives"]
+            ),
+        )
+
+    return (
+        False,
+        "初回は全て残席なし。後の列車3候補も○/△なし。 "
+        + " / ".join(later["details"]),
+    )
+
+
+def run_once() -> int:
+    if in_maintenance():
+        print(
+            f"[{now_text()}] 01:30-05:30 JST は監視停止。"
+            "e5489にはアクセスしません。",
+            flush=True,
+        )
+        return 0
+
+    state = load_state()
+    was_notified = bool(
+        state.get(
+            "ntfy_notified",
+            False,
+        )
+    )
+
+    available = None
+    details = ""
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=True
+        )
+
+        context = browser.new_context(
+            locale="ja-JP",
+            timezone_id="Asia/Tokyo",
+            viewport={
+                "width": 430,
+                "height": 1600,
+            },
+            user_agent=(
+                "Mozilla/5.0 "
+                "(Linux; Android 13; Pixel 7) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/140.0.0.0 "
+                "Mobile Safari/537.36"
+            ),
+        )
+
+        page = context.new_page()
+
+        try:
+            for attempt in range(
+                1,
+                MAX_ATTEMPTS + 1,
+            ):
+                try:
+                    print(
+                        f"[{now_text()}] "
+                        f"CHECK {attempt}/{MAX_ATTEMPTS}",
+                        flush=True,
+                    )
+
+                    available, details = (
+                        perform_check(page)
+                    )
+                    break
+
+                except Exception as exc:
+                    print(
+                        f"  -> 確認不能: "
+                        f"{type(exc).__name__}: {exc}; "
+                        f"{page_diag(page)}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+                    if attempt < MAX_ATTEMPTS:
+                        print(
+                            f"  -> {RETRY_WAIT_SECONDS}秒後に"
+                            "トップからやり直します",
+                            flush=True,
+                        )
+                        time.sleep(
+                            RETRY_WAIT_SECONDS
+                        )
+
+        finally:
+            page.close()
+            context.close()
+            browser.close()
+
+    if available is None:
+        print(
+            f"[{now_text()}] SUMMARY: 今回確認不能。"
+            "前回状態は変更しません。",
+            flush=True,
+        )
+        return 0
+
+    if available:
+        print(
+            f"[{now_text()}] 空席検出: {details}",
+            flush=True,
+        )
+
+        if not was_notified:
+            try:
+                stage = (
+                    "後の列車で空席を検出"
+                    if details.startswith(
+                        "後の列車"
+                    )
+                    else "最初の検索結果で空席を検出"
+                )
+
+                send_ntfy(
+                    stage,
+                    details,
+                )
+
+                state[
+                    "ntfy_notified"
+                ] = True
+
+                print(
+                    "  -> ntfy通知送信",
+                    flush=True,
+                )
+
+            except Exception as exc:
+                print(
+                    f"  -> ntfy送信失敗 "
+                    f"({type(exc).__name__})。"
+                    "次回再送します。",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+                state[
+                    "ntfy_notified"
+                ] = False
+
+    else:
+        print(
+            f"[{now_text()}] 空席なし: {details}",
+            flush=True,
+        )
+
+        # ×へ戻ったら、次に○/△が出た際に再通知
+        state[
+            "ntfy_notified"
+        ] = False
+
+    state["available"] = available
+    state["details"] = details
+    state["last_checked"] = now_text()
+
+    save_state(state)
+
+    print(
+        f"[{now_text()}] SUMMARY: "
+        f"available={available}, "
+        f"notified="
+        f"{state.get('ntfy_notified', False)}",
+        flush=True,
+    )
+
+    return 0
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--test-ntfy",
+        action="store_true",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    if args.test_ntfy:
+        send_test_ntfy()
+        print(
+            "ntfyテスト通知を送信しました。"
+        )
+        return 0
+
+    return run_once()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 
 
 def require_env(name: str) -> str:
