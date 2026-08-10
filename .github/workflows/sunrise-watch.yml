@@ -1,13 +1,8 @@
 name: Sunrise Izumo Watch
 
 on:
-  # 5分ごと（毎時 02,07,12,...57 分）。
-  # 01:30-05:30 JST もWorkflow自体は起動しますが、
-  # Python側が即終了するため e5489 にはアクセスしません。
   schedule:
     - cron: '2/5 * * * *'
-
-  # 手動テスト用。pull_request / pull_request_target / push は定義しない。
   workflow_dispatch:
     inputs:
       test_ntfy:
@@ -27,15 +22,14 @@ jobs:
   watch:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     env:
       NTFY_TOPIC_URL: ${{ secrets.NTFY_TOPIC_URL }}
       TRIP_LABEL: ${{ secrets.TRIP_LABEL }}
-      URL_SINGLE_DELUXE: ${{ secrets.URL_SINGLE_DELUXE }}
-      URL_SINGLE_TWIN: ${{ secrets.URL_SINGLE_TWIN }}
-      URL_SINGLE: ${{ secrets.URL_SINGLE }}
-      URL_SOLO: ${{ secrets.URL_SOLO }}
-      URL_SUNRISE_TWIN: ${{ secrets.URL_SUNRISE_TWIN }}
+      DEPART_STATION: ${{ secrets.DEPART_STATION }}
+      ARRIVE_STATION: ${{ secrets.ARRIVE_STATION }}
+      TRAVEL_DATE: ${{ secrets.TRAVEL_DATE }}
+      DEPART_HOUR: ${{ secrets.DEPART_HOUR }}
+      DEPART_MINUTE: ${{ secrets.DEPART_MINUTE }}
       STATE_FILE: .state/sunrise_state.json
 
     steps:
