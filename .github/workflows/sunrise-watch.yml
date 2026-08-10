@@ -94,8 +94,12 @@ jobs:
         run: python sunrise_watch_actions.py
 
       # stateには空席通知済みかどうかだけを保存。URLやntfyトピックは入らない。
+      - name: Ensure monitor state exists
+        if: always() && (github.event_name != 'workflow_dispatch' || inputs.test_ntfy != true)
+        run: mkdir -p .state && test -f .state/sunrise_state.json || echo '{}' > .state/sunrise_state.json
+
       - name: Save monitor state
-        if: always()
+        if: always() && (github.event_name != 'workflow_dispatch' || inputs.test_ntfy != true)
         uses: actions/cache/save@v4
         with:
           path: .state
