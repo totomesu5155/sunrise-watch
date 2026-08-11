@@ -2,6 +2,8 @@ name: Sunrise Izumo Watch
 
 on:
   schedule:
+    # cronのずれはそのまま利用。
+    # 受付時間の待機・停止判定はPython側で行う。
     - cron: '7-59/5 * * * *'
 
   workflow_dispatch:
@@ -22,7 +24,9 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 65
+
+    # 最大約1時間の05:30待機 + 10回リトライ + 55分監視に余裕を持たせる。
+    timeout-minutes: 150
 
     env:
       NTFY_TOPIC_URL: ${{ secrets.NTFY_TOPIC_URL }}
@@ -85,28 +89,35 @@ jobs:
         if: github.event_name != 'workflow_dispatch' || inputs.test_ntfy != true
         shell: bash
         run: |
-          end=$((SECONDS + 3300))
+          # 55分タイマーは最初のPython呼び出しが戻った後に開始する。
+          # そのため04:30～05:29にPythonが05:30までsleepしても
+          # 監視時間を消費しない。
+          end=0
           pass=1
           error_streak=0
 
           while true; do
-            hour=$(TZ=Asia/Tokyo date +%H)
-            minute=$(TZ=Asia/Tokyo date +%M)
-            now_minutes=$((10#$hour * 60 + 10#$minute))
-
-            if (( now_minutes >= 90 && now_minutes < 330 )); then
-              echo "01:30-05:30 JST は監視停止時間です。"
-              break
-            fi
-
             echo "============================================================"
             echo "STABLE DENSE PASS ${pass}"
+            echo "開始: $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M:%S JST')"
             echo "============================================================"
 
             set +e
             python sunrise_watch_actions.py
             rc=$?
             set -e
+
+            # rc=3:
+            # 01:50～04:29など、05:30まで1時間以上ある停止時間。
+            # PythonがJRへアクセスせず終了したので、このworkflowも終える。
+            if (( rc == 3 )); then
+              echo "e5489停止時間。後続cronに任せてこのworkflowを終了します。"
+              break
+            fi
+
+            if (( end == 0 )); then
+              end=$((SECONDS + 3300))
+            fi
 
             remaining=$((end - SECONDS))
             if (( remaining < 150 )); then
@@ -116,6 +127,7 @@ jobs:
 
             if (( rc == 2 )); then
               error_streak=$((error_streak + 1))
+
               if (( error_streak == 1 )); then
                 wait=$((120 + RANDOM % 31))
               elif (( error_streak == 2 )); then
@@ -123,6 +135,7 @@ jobs:
               else
                 wait=$((240 + RANDOM % 61))
               fi
+
               echo "確認不能が ${error_streak} 回連続。${wait}秒休んで再確認します"
             else
               error_streak=0
