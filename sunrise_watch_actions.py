@@ -589,54 +589,87 @@ def submit_search(page) -> None:
 # ------------------------------------------------------------
 
 def read_initial_route_status(page) -> dict:
-    table = page.locator(
-        "table.seat-status-table"
-    ).first
+    """
+    最初の「経路・設備選択」では、普通の指定席と寝台が同じ列車内に並ぶ。
 
-    rows = table.locator("tr")
-    results = []
+    通知対象は寝台だけ:
+      - B寝台
+      - A寝台
 
-    for i in range(rows.count()):
-        row = rows.nth(i)
+    「普通」の指定席に○/△が出ても通知しない。
+    ただし参考情報としてログには出す。
 
-        imgs = row.locator(
-            'img[alt="空席あり"], '
-            'img[alt="空席残りわずか"], '
-            'img[alt="残席なし"]'
-        )
+    実ページ構造:
+      dl.car-grouping-list
+        dt  普通
+        dd  ... img alt="空席残りわずか"
+        dt  B寝台
+        dd  ... img alt="残席なし" ...
+        dt  A寝台
+        dd  ... img alt="残席なし" ...
+    """
+    groups = page.locator("dl.car-grouping-list")
 
-        if imgs.count() == 0:
-            continue
-
-        label = norm(
-            row.inner_text()
-        )
-
-        alts = []
-        for j in range(imgs.count()):
-            alt = imgs.nth(j).get_attribute(
-                "alt"
-            )
-            if alt:
-                alts.append(alt)
-
-        results.append({
-            "label": label,
-            "alts": alts,
-        })
-
-    if not results:
+    if groups.count() == 0:
         raise TemporaryPageError(
-            "最初の空席状態を取得できない"
+            "最初の空席一覧（car-grouping-list）が見つからない"
+        )
+
+    sleeper_rows = []
+    ordinary_rows = []
+
+    for g in range(groups.count()):
+        dl = groups.nth(g)
+        dts = dl.locator(":scope > dt")
+
+        for i in range(dts.count()):
+            dt = dts.nth(i)
+            label = norm(dt.inner_text())
+
+            # 対応する直後のdd
+            dd = dt.locator("xpath=following-sibling::dd[1]")
+
+            if dd.count() == 0:
+                continue
+
+            imgs = dd.locator(
+                'img[alt="空席あり"], '
+                'img[alt="空席残りわずか"], '
+                'img[alt="残席なし"]'
+            )
+
+            alts = []
+            for j in range(imgs.count()):
+                alt = imgs.nth(j).get_attribute("alt")
+                if alt:
+                    alts.append(alt)
+
+            if not alts:
+                continue
+
+            row = {
+                "label": label,
+                "alts": alts,
+            }
+
+            if "B寝台" in label or "A寝台" in label:
+                sleeper_rows.append(row)
+            else:
+                ordinary_rows.append(row)
+
+    if not sleeper_rows:
+        raise TemporaryPageError(
+            "B寝台/A寝台の空席状態を取得できない"
         )
 
     positives = []
     total_marks = 0
     negative_marks = 0
 
-    for item in results:
+    for item in sleeper_rows:
         for alt in item["alts"]:
             total_marks += 1
+
             if alt in POSITIVE_ALTS:
                 positives.append(
                     f"{item['label']}:{alt}"
@@ -644,8 +677,29 @@ def read_initial_route_status(page) -> dict:
             elif alt == NEGATIVE_ALT:
                 negative_marks += 1
 
+    # 普通指定席は通知対象外だが、誤解防止のためログに出す。
+    if ordinary_rows:
+        ordinary_text = " / ".join(
+            f"{item['label']}:{'/'.join(item['alts'])}"
+            for item in ordinary_rows
+        )
+        print(
+            f"  -> 参考（通知対象外）: {ordinary_text}",
+            flush=True,
+        )
+
+    sleeper_text = " / ".join(
+        f"{item['label']}:{'/'.join(item['alts'])}"
+        for item in sleeper_rows
+    )
+
+    print(
+        f"  -> 寝台判定: {sleeper_text}",
+        flush=True,
+    )
+
     return {
-        "rows": results,
+        "rows": sleeper_rows,
         "positives": positives,
         "all_negative": (
             total_marks > 0
@@ -996,8 +1050,8 @@ def perform_check(page) -> tuple[bool, str]:
     )
 
     print(
-        f"  -> 初回空席マーク数={initial['total']}, "
-        f"空席あり={len(initial['positives'])}",
+        f"  -> 初回寝台マーク数={initial['total']}, "
+        f"寝台空席あり={len(initial['positives'])}",
         flush=True,
     )
 
