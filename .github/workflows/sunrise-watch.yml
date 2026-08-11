@@ -1,10 +1,8 @@
 name: Sunrise Izumo Watch
 
 on:
-  # GitHub scheduleの最短は5分。
-  # 毎時 03,08,13,...58 分に起動する。
   schedule:
-    - cron: '3/5 * * * *'
+    - cron: '7-59/5 * * * *'
   workflow_dispatch:
     inputs:
       test_ntfy:
@@ -16,8 +14,6 @@ on:
 permissions:
   contents: read
 
-# 同じ監視を同時に走らせない。
-# 前のrunが少し長引いた場合は次のrunを待たせる。
 concurrency:
   group: sunrise-izumo-watch
   cancel-in-progress: false
@@ -25,7 +21,7 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
 
     env:
       NTFY_TOPIC_URL: ${{ secrets.NTFY_TOPIC_URL }}
@@ -34,6 +30,100 @@ jobs:
       ARRIVE_STATION: ${{ secrets.ARRIVE_STATION }}
       TRAVEL_DATE: ${{ secrets.TRAVEL_DATE }}
       DEPART_HOUR: ${{ secrets.DEPART_HOUR }}
+      DEPART_MINUTE: ${{ secrets.DEPART_MINUTE }}
+      STATE_FILE: .state/sunrise_state.json
+      SUNRISE_MAX_ATTEMPTS: '1'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Restore Playwright browser cache
+        id: playwright-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Restore monitor state
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: sunrise-state-${{ github.run_id }}
+          restore-keys: |
+            sunrise-state-
+
+      - name: Install Python package
+        run: python -m pip install -r requirements.txt
+
+      - name: Install Chromium OS dependencies
+        run: python -m playwright install-deps chromium
+
+      - name: Install Chromium
+        run: python -m playwright install chromium
+
+      - name: Save Playwright browser cache
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Run ntfy test
+        if: github.event_name == 'workflow_dispatch' && inputs.test_ntfy == true
+        run: python sunrise_watch_actions.py --test-ntfy
+
+      - name: Dense monitor
+        if: github.event_name != 'workflow_dispatch' || inputs.test_ntfy != true
+        shell: bash
+        run: |
+          hour=$(TZ=Asia/Tokyo date +%H)
+          minute=$(TZ=Asia/Tokyo date +%M)
+          now_minutes=$((10#$hour * 60 + 10#$minute))
+
+          if (( now_minutes >= 90 && now_minutes < 330 )); then
+            echo "01:30-05:30 JST は監視停止時間です。"
+            exit 0
+          fi
+
+          end=$((SECONDS + 1500))
+          pass=1
+
+          while true; do
+            echo "============================================================"
+            echo "DENSE MONITOR PASS ${pass}"
+            echo "============================================================"
+
+            python sunrise_watch_actions.py
+
+            remaining=$((end - SECONDS))
+            if (( remaining < 120 )); then
+              echo "25分監視ウィンドウを終了します"
+              break
+            fi
+
+            wait=$((60 + RANDOM % 31))
+            echo "${wait}秒後に新しいセッションで再確認します"
+            sleep "$wait"
+            pass=$((pass + 1))
+          done
+
+      - name: Ensure monitor state exists
+        if: always() && (github.event_name != 'workflow_dispatch' || inputs.test_ntfy != true)
+        run: mkdir -p .state && test -f .state/sunrise_state.json || echo '{}' > .state/sunrise_state.json
+
+      - name: Save monitor state
+        if: always() && (github.event_name != 'workflow_dispatch' || inputs.test_ntfy != true)
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: sunrise-state-${{ github.run_id }}
       DEPART_MINUTE: ${{ secrets.DEPART_MINUTE }}
       STATE_FILE: .state/sunrise_state.json
 
