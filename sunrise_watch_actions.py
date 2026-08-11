@@ -9,7 +9,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -17,11 +17,45 @@ from playwright.sync_api import sync_playwright
 
 JST = ZoneInfo("Asia/Tokyo")
 
-SCRIPT_VERSION = "2026-08-11-mobile-table-v2"
+SCRIPT_VERSION = "2026-08-12-maintenance-wait-v2"
 
-# JR側にアクセスしない時間
-MAINTENANCE_START = dt_time(1, 30)
-MAINTENANCE_END = dt_time(5, 30)
+# ------------------------------------------------------------
+# e5489 受付時間
+#
+# 通常日:
+#   05:30～23:50
+#   00:05～01:50
+#
+# 通常の停止:
+#   23:50～00:05
+#   01:50～05:30
+#
+# 臨時メンテナンス日:
+#   23:30～翌05:30
+#
+# 長い停止時間は、05:30の1時間前（04:30）以降に起動したrunだけ
+# Python側で05:30まで待機する。それ以前ならJRへアクセスせず終了し、
+# 後続cronに任せる。
+# ------------------------------------------------------------
+
+SERVICE_MORNING = dt_time(5, 30)
+NORMAL_NIGHT_BREAK_START = dt_time(23, 50)
+NORMAL_NIGHT_BREAK_END = dt_time(0, 5)
+NORMAL_DEEP_MAINT_START = dt_time(1, 50)
+PREWAIT_START = dt_time(4, 30)
+
+# JR西日本の公式メンテナンス表で、今回の9/3乗車までに
+# e5489が23:30～翌05:30停止する「開始日」。
+SPECIAL_MAINTENANCE_START_DATES = {
+    "2026-08-17",
+    "2026-08-18",
+    "2026-08-20",
+    "2026-08-22",
+    "2026-08-25",
+    "2026-08-27",
+    "2026-08-29",
+    "2026-08-31",
+}
 
 # 必ずトップ画面から入り、「新規予約」を押す
 TOP_URL = "https://e5489.jr-odekake.net/e5489/cssp/CBTopMenuSP"
@@ -64,9 +98,177 @@ def now_text() -> str:
     return now_jst().strftime("%Y-%m-%d %H:%M:%S JST")
 
 
-def in_maintenance() -> bool:
-    t = now_jst().time().replace(tzinfo=None)
-    return MAINTENANCE_START <= t < MAINTENANCE_END
+def special_maintenance_active(now: datetime) -> bool:
+    """現在時刻が、公式発表済みのe5489臨時メンテ時間か。"""
+    today = now.date().isoformat()
+    yesterday = (now.date() - timedelta(days=1)).isoformat()
+    t = now.time().replace(tzinfo=None)
+
+    # 開始日の23:30以降
+    if today in SPECIAL_MAINTENANCE_START_DATES and t >= dt_time(23, 30):
+        return True
+
+    # 翌日の00:00～05:30
+    if yesterday in SPECIAL_MAINTENANCE_START_DATES and t < SERVICE_MORNING:
+        return True
+
+    return False
+
+
+def seconds_until_next_0530(now: datetime) -> float:
+    target = now.replace(
+        hour=5,
+        minute=30,
+        second=0,
+        microsecond=0,
+    )
+    if now >= target:
+        target += timedelta(days=1)
+    return max(0.0, (target - now).total_seconds())
+
+
+def sleep_until_0530(now: datetime, reason: str) -> None:
+    """JRへアクセスせず、05:30:00 JSTまで待つ。"""
+    remain = seconds_until_next_0530(now)
+
+    print(
+        f"[{now_text()}] {reason}。"
+        f"05:30開始まであと{remain:.0f}秒。"
+        "e5489にはまだアクセスしません。",
+        flush=True,
+    )
+
+    # 長時間はまとめてsleepし、最後の2秒だけ細かく合わせる。
+    coarse = max(0.0, remain - 2.0)
+    if coarse > 0:
+        time.sleep(coarse)
+
+    while True:
+        current = now_jst()
+        left = seconds_until_next_0530(current)
+
+        # 05:30を過ぎるとseconds_until_next_0530は翌日を指すため、
+        # 現在時刻そのものでも判定する。
+        current_t = current.time().replace(tzinfo=None)
+        if SERVICE_MORNING <= current_t < dt_time(23, 30):
+            break
+
+        if left <= 0:
+            break
+
+        time.sleep(min(0.2, left))
+
+    print(
+        f"[{now_text()}] 05:30到達。監視を開始します。",
+        flush=True,
+    )
+
+
+def wait_for_service_window() -> bool:
+    """
+    e5489の受付時間に合わせる。
+
+    True:
+        このまま監視開始してよい。
+
+    False:
+        今回はJRへアクセスせず終了し、後続cronに任せる。
+
+    方針:
+      * 通常23:50～00:05は短いので、その場で00:05まで待つ。
+      * 01:50～05:30の長時間停止は、
+        04:30以降なら05:30まで待つ。
+        04:30より前なら終了。
+      * 臨時メンテ（23:30～05:30）も同じく、
+        04:30以降だけ05:30まで待つ。
+    """
+    now = now_jst()
+    t = now.time().replace(tzinfo=None)
+
+    # 1) 臨時メンテ 23:30～翌05:30
+    if special_maintenance_active(now):
+        if PREWAIT_START <= t < SERVICE_MORNING:
+            sleep_until_0530(
+                now,
+                "e5489臨時メンテ中・05:30直前待機",
+            )
+            return True
+
+        print(
+            f"[{now_text()}] e5489臨時メンテ中。"
+            "05:30まで1時間以上あるため、"
+            "e5489にはアクセスせず今回のrunを終了します。",
+            flush=True,
+        )
+        return False
+
+    # 2) 通常日の23:50～24:00
+    if t >= NORMAL_NIGHT_BREAK_START:
+        target = now.replace(
+            hour=0,
+            minute=5,
+            second=0,
+            microsecond=0,
+        ) + timedelta(days=1)
+        remain = max(0.0, (target - now).total_seconds())
+
+        print(
+            f"[{now_text()}] 通常の23:50～00:05停止中。"
+            f"00:05まで{remain:.0f}秒待機します。",
+            flush=True,
+        )
+        time.sleep(remain)
+        print(
+            f"[{now_text()}] 00:05到達。監視を再開します。",
+            flush=True,
+        )
+        return True
+
+    # 3) 通常日の00:00～00:05
+    if t < NORMAL_NIGHT_BREAK_END:
+        target = now.replace(
+            hour=0,
+            minute=5,
+            second=0,
+            microsecond=0,
+        )
+        remain = max(0.0, (target - now).total_seconds())
+
+        print(
+            f"[{now_text()}] 通常の23:50～00:05停止中。"
+            f"00:05まで{remain:.0f}秒待機します。",
+            flush=True,
+        )
+        time.sleep(remain)
+        print(
+            f"[{now_text()}] 00:05到達。監視を再開します。",
+            flush=True,
+        )
+        return True
+
+    # 4) 通常日の00:05～01:50は受付中
+    if NORMAL_NIGHT_BREAK_END <= t < NORMAL_DEEP_MAINT_START:
+        return True
+
+    # 5) 通常日の01:50～05:30
+    if NORMAL_DEEP_MAINT_START <= t < SERVICE_MORNING:
+        if PREWAIT_START <= t:
+            sleep_until_0530(
+                now,
+                "通常メンテ中・05:30直前待機",
+            )
+            return True
+
+        print(
+            f"[{now_text()}] 通常メンテ中（01:50～05:30）。"
+            "05:30まで1時間以上あるため、"
+            "e5489にはアクセスせず今回のrunを終了します。",
+            flush=True,
+        )
+        return False
+
+    # 6) 05:30～23:50は受付中
+    return True
 
 
 def norm(s: str | None) -> str:
@@ -1089,12 +1291,10 @@ def run_once() -> int:
         flush=True,
     )
 
-    if in_maintenance():
-        print(
-            f"[{now_text()}] 01:30-05:30 JST は監視停止。"
-            "e5489にはアクセスしません。",
-            flush=True,
-        )
+    if not wait_for_service_window():
+        # Workflow側に「メンテ中なのでこのPASS/runは終えてよい」と知らせる。
+        if os.getenv("SUNRISE_SIGNAL_EXIT", "0") == "1":
+            return 3
         return 0
 
     state = load_state()
