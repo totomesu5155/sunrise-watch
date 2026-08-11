@@ -22,7 +22,7 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 65
 
     env:
       NTFY_TOPIC_URL: ${{ secrets.NTFY_TOPIC_URL }}
@@ -80,23 +80,23 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.test_ntfy == true
         run: python sunrise_watch_actions.py --test-ntfy
 
-      - name: Dense monitor
+      - name: Dense monitor for 55 minutes
         if: github.event_name != 'workflow_dispatch' || inputs.test_ntfy != true
         shell: bash
         run: |
-          hour=$(TZ=Asia/Tokyo date +%H)
-          minute=$(TZ=Asia/Tokyo date +%M)
-          now_minutes=$((10#$hour * 60 + 10#$minute))
-
-          if (( now_minutes >= 90 && now_minutes < 330 )); then
-            echo "01:30-05:30 JST は監視停止時間です。"
-            exit 0
-          fi
-
-          end=$((SECONDS + 1500))
+          end=$((SECONDS + 3300))
           pass=1
 
           while true; do
+            hour=$(TZ=Asia/Tokyo date +%H)
+            minute=$(TZ=Asia/Tokyo date +%M)
+            now_minutes=$((10#$hour * 60 + 10#$minute))
+
+            if (( now_minutes >= 90 && now_minutes < 330 )); then
+              echo "01:30-05:30 JST は監視停止時間です。"
+              break
+            fi
+
             echo "============================================================"
             echo "DENSE MONITOR PASS ${pass}"
             echo "============================================================"
@@ -104,12 +104,12 @@ jobs:
             python sunrise_watch_actions.py
 
             remaining=$((end - SECONDS))
-            if (( remaining < 120 )); then
-              echo "25分監視ウィンドウを終了します"
+            if (( remaining < 90 )); then
+              echo "55分監視ウィンドウを終了します"
               break
             fi
 
-            wait=$((60 + RANDOM % 31))
+            wait=$((35 + RANDOM % 16))
             echo "${wait}秒後に新しいセッションで再確認します"
             sleep "$wait"
             pass=$((pass + 1))
