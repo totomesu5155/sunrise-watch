@@ -33,7 +33,7 @@ jobs:
       DEPART_HOUR: ${{ secrets.DEPART_HOUR }}
       DEPART_MINUTE: ${{ secrets.DEPART_MINUTE }}
       STATE_FILE: .state/sunrise_state.json
-      SUNRISE_MAX_ATTEMPTS: '2'
+      SUNRISE_MAX_ATTEMPTS: '10'
       SUNRISE_SIGNAL_EXIT: '1'
 
     steps:
