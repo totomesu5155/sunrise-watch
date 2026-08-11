@@ -28,16 +28,16 @@ STATE_FILE = Path(os.getenv("STATE_FILE", ".state/sunrise_state.json"))
 
 # e5489は同じ条件でも一時的な「ご案内」を返すことがあるため、
 # 1巡回内で複数回試す。
-# デフォルトでリトライ回数を 10回 に変更
-MAX_ATTEMPTS = max(1, int(os.getenv("SUNRISE_MAX_ATTEMPTS", "10")))
+# DENSE監視内でも再実行されるため、1巡回内のリトライは3回を上限にする
+MAX_ATTEMPTS = max(1, int(os.getenv("SUNRISE_MAX_ATTEMPTS", "3")))
 
 # 失敗時の段階的な待ち時間（秒）
-RETRY_BACKOFF_SECONDS = (15, 30, 45, 60, 75, 90, 105, 120)
+RETRY_BACKOFF_SECONDS = (15, 30, 60)
 # 失敗時の最大待ち時間上限（120秒）
 MAX_BACKOFF_SECONDS = 120
 
-# 10回のリトライ＋最大120秒待ちに対応できるよう、全体の打ち切り時間を拡張（10分）
-MAX_RUN_SECONDS = int(os.getenv("SUNRISE_MAX_RUN_SECONDS", "600"))
+# 1巡回が長くなりすぎないよう最大4分で打ち切る
+MAX_RUN_SECONDS = int(os.getenv("SUNRISE_MAX_RUN_SECONDS", "240"))
 
 POSITIVE_ALTS = {"空席あり", "空席残りわずか"}
 NEGATIVE_ALT = "残席なし"
@@ -497,23 +497,44 @@ def submit_search(page) -> None:
             "「検索する（新規予約）」ボタンが見つからない"
         )
 
-    button.first.click()
-    page.wait_for_timeout(1800)
-
     try:
-        page.wait_for_load_state("domcontentloaded", timeout=20000)
+        with page.expect_navigation(
+            wait_until="domcontentloaded",
+            timeout=20000,
+        ):
+            button.first.click()
     except Exception:
-        pass
+        # navigationイベントを取り逃した場合も、実ページを見て続行する。
+        page.wait_for_timeout(1200)
 
     if is_guide_or_error(page):
         raise TemporaryPageError("検索後にご案内/エラー")
 
-    if page.locator("table.seat-status-table").count() == 0:
+    # 重要:
+    # この画面の実HTMLでは空席一覧は table.seat-status-table ではなく、
+    # dl.car-grouping-list の中に「普通 / B寝台 / A寝台」が並んでいる。
+    # seat-status-table は保存HTML内のCSS定義には存在するが、
+    # この検索結果本文には存在しない。
+    groups = page.locator("dl.car-grouping-list")
+
+    try:
+        groups.first.wait_for(
+            state="attached",
+            timeout=10000,
+        )
+    except Exception:
+        body = norm(page.locator("body").inner_text(timeout=5000))
         raise TemporaryPageError(
-            "経路・設備選択の空席表が見つからない"
+            "経路・設備選択ページには到達したが、"
+            "B寝台/A寝台の一覧（car-grouping-list）が見つからない; "
+            f"sunrise={'サンライズ出雲' in body}"
         )
 
-    print(f"  -> 検索結果: {current_path(page)}", flush=True)
+    print(
+        f"  -> 検索結果: {current_path(page)} "
+        f"(car-grouping-list={groups.count()})",
+        flush=True,
+    )
 
 
 # ------------------------------------------------------------
