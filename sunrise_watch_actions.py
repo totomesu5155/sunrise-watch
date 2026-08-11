@@ -17,7 +17,7 @@ from playwright.sync_api import sync_playwright
 
 JST = ZoneInfo("Asia/Tokyo")
 
-SCRIPT_VERSION = "2026-08-11-mobile-exact-v1"
+SCRIPT_VERSION = "2026-08-11-mobile-table-v2"
 
 # JR側にアクセスしない時間
 MAINTENANCE_START = dt_time(1, 30)
@@ -508,7 +508,7 @@ def submit_search(page) -> None:
         ):
             button.first.click(timeout=8000)
     except Exception:
-        # navigationイベントを取り逃した場合でも実ページを確認する。
+        # navigationイベントを取り逃しても、遷移済みなら続行する。
         page.wait_for_timeout(800)
 
     print(
@@ -520,20 +520,40 @@ def submit_search(page) -> None:
     if is_guide_or_error(page):
         raise TemporaryPageError("検索後にご案内/エラー")
 
-    # 実際に保存されたスマホ版(cssp)のHTMLでは、
-    # dl.car-grouping-list > dt の中に
-    # img[alt="B寝台"] / img[alt="A寝台"] がある。
+    # 保存された実際のスマホ版HTMLでは、
+    # car-grouping-list の直下は dt/dd ではなく table.seat-status-table。
+    # 「サンライズ出雲」の列車ブロック内に B寝台/A寝台の行が出るまで待つ。
     try:
-        page.locator(
-            'dl.car-grouping-list > dt img[alt="B寝台"]'
-        ).first.wait_for(
-            state="attached",
-            timeout=12000,
-        )
-        page.locator(
-            'dl.car-grouping-list > dt img[alt="A寝台"]'
-        ).first.wait_for(
-            state="attached",
+        page.wait_for_function(
+            """() => {
+                const routes = Array.from(
+                    document.querySelectorAll(
+                        'ol.route-train-list > li.route-train-list__line.express'
+                    )
+                );
+
+                const route = routes.find(li => {
+                    const title = (
+                        li.querySelector('.route-train-list__train')
+                        ?.textContent || ''
+                    );
+                    return title.includes('サンライズ出雲');
+                });
+
+                if (!route) return false;
+
+                const rows = Array.from(
+                    route.querySelectorAll(
+                        'table.seat-status-table tr'
+                    )
+                );
+
+                return rows.some(tr =>
+                    tr.querySelector('img[alt="B寝台"]')
+                ) && rows.some(tr =>
+                    tr.querySelector('img[alt="A寝台"]')
+                );
+            }""",
             timeout=12000,
         )
     except Exception:
@@ -542,7 +562,7 @@ def submit_search(page) -> None:
         )
         raise TemporaryPageError(
             "経路・設備選択ページには到達したが、"
-            "スマホ版のB寝台/A寝台見出しを確認できない"
+            "サンライズ出雲の寝台テーブルを確認できない"
             f" (sunrise={'サンライズ出雲' in body}, "
             f"B寝台={'B寝台' in body}, "
             f"A寝台={'A寝台' in body})"
@@ -560,18 +580,20 @@ def submit_search(page) -> None:
 
 def read_initial_route_status(page) -> dict:
     """
-    スマホ版(cssp)の実HTML構造に合わせて判定する。
+    スマホ版(cssp)の保存HTMLで確認した実構造に合わせる。
 
-    dl.car-grouping-list
-      dt  普通
-      dd  ... 空席画像
-      dt  <img alt="B寝台">B寝台
-      dd  ... 空席画像
-      dt  <img alt="A寝台">A寝台
-      dd  ... 空席画像
+    ol.route-train-list
+      li ... 特急サンライズ出雲
+        dl.car-grouping-list
+          table.seat-status-table
+            tr 普通 ...
+            tr B寝台 禁煙 ...
+            tr B寝台 喫煙 ...
+            tr A寝台 禁煙 ...
+            tr A寝台 喫煙 ...
 
-    dtの直後のddだけを対象にするため、
-    「普通」の△を寝台空席として誤認しない。
+    画面上は「普通 / B寝台 / A寝台」に見えるが、
+    DOMは dt/dd ではなく table/tr なので、行単位で判定する。
     """
 
     result = page.evaluate(
@@ -585,126 +607,167 @@ def read_initial_route_status(page) -> dict:
             const normalize = s =>
                 (s || '').replace(/\\s+/g, ' ').trim();
 
-            function findDt(kind) {
-                const all = Array.from(
-                    document.querySelectorAll(
-                        'dl.car-grouping-list > dt'
-                    )
+            const routes = Array.from(
+                document.querySelectorAll(
+                    'ol.route-train-list > li.route-train-list__line.express'
+                )
+            );
+
+            const route = routes.find(li => {
+                const title = normalize(
+                    li.querySelector('.route-train-list__train')
+                    ?.textContent
                 );
+                return title.includes('サンライズ出雲')
+                    && li.querySelector('table.seat-status-table tr');
+            });
 
-                if (kind === '普通') {
-                    return all.find(dt =>
-                        normalize(dt.textContent).includes('普通')
-                    ) || null;
-                }
-
-                return all.find(dt =>
-                    dt.querySelector(`img[alt="${kind}"]`) ||
-                    normalize(dt.textContent).includes(kind)
-                ) || null;
+            if (!route) {
+                return {
+                    routeFound: false,
+                    title: '',
+                    rows: []
+                };
             }
 
-            function collect(kind) {
-                const dt = findDt(kind);
+            const title = normalize(
+                route.querySelector('.route-train-list__train')
+                ?.textContent
+            );
 
-                if (!dt) {
-                    return {
-                        kind,
-                        found: false,
-                        alts: []
-                    };
+            // 同じ列車ブロック内に空tableがある場合があるため、
+            // trを持つtableだけを見る。
+            const tables = Array.from(
+                route.querySelectorAll('table.seat-status-table')
+            ).filter(t => t.querySelector('tr'));
+
+            const table = tables[0] || null;
+
+            if (!table) {
+                return {
+                    routeFound: true,
+                    tableFound: false,
+                    title,
+                    rows: []
+                };
+            }
+
+            const rows = Array.from(
+                table.querySelectorAll('tr')
+            ).map(tr => {
+                let kind = '';
+
+                if (tr.querySelector('img[alt="B寝台"]')) {
+                    kind = 'B寝台';
+                } else if (tr.querySelector('img[alt="A寝台"]')) {
+                    kind = 'A寝台';
+                } else {
+                    const carType = normalize(
+                        tr.querySelector('.car-type')?.textContent
+                    );
+                    if (carType.includes('普通')) {
+                        kind = '普通';
+                    } else {
+                        kind = carType;
+                    }
                 }
 
-                const dd = dt.nextElementSibling;
-
-                if (!dd || dd.tagName !== 'DD') {
-                    return {
-                        kind,
-                        found: true,
-                        ddFound: false,
-                        alts: []
-                    };
-                }
-
-                const alts = Array.from(
-                    dd.querySelectorAll('img[alt]')
+                const statusAlts = Array.from(
+                    tr.querySelectorAll('td img[alt]')
                 )
                 .map(img => img.getAttribute('alt'))
                 .filter(alt => STATUS.has(alt));
 
                 return {
                     kind,
-                    found: true,
-                    ddFound: true,
-                    alts
+                    text: normalize(tr.textContent),
+                    statusAlts
                 };
-            }
+            });
 
             return {
-                ordinary: collect('普通'),
-                b: collect('B寝台'),
-                a: collect('A寝台'),
-                groupCount: document.querySelectorAll(
-                    'dl.car-grouping-list'
-                ).length
+                routeFound: true,
+                tableFound: true,
+                title,
+                tableCount: tables.length,
+                rows
             };
         }"""
     )
 
-    ordinary = result.get("ordinary") or {}
-    b = result.get("b") or {}
-    a = result.get("a") or {}
+    rows = result.get("rows") or []
+
+    diag = " / ".join(
+        f"{row.get('kind') or '(不明)'}:"
+        f"{','.join(row.get('statusAlts') or []) or 'markなし'}"
+        for row in rows
+    )
 
     print(
-        "  -> スマホ版DOM解析: "
-        f"groups={result.get('groupCount', 0)}, "
-        f"普通={ordinary.get('alts', [])}, "
-        f"B寝台={b.get('alts', [])}, "
-        f"A寝台={a.get('alts', [])}",
+        "  -> スマホ版テーブル解析: "
+        f"title={result.get('title')!r}, "
+        f"tables={result.get('tableCount', 0)}, "
+        f"rows={len(rows)} [{diag}]",
         flush=True,
     )
 
-    if not b.get("found") or not a.get("found"):
+    if not result.get("routeFound"):
         raise TemporaryPageError(
-            "B寝台/A寝台の見出しを取得できない"
+            "サンライズ出雲の列車ブロックを取得できない"
         )
 
-    if not b.get("ddFound") or not a.get("ddFound"):
+    if not result.get("tableFound"):
         raise TemporaryPageError(
-            "B寝台/A寝台の空席欄(dd)を取得できない"
+            "サンライズ出雲のseat-status-tableを取得できない"
         )
 
-    b_alts = [
-        x for x in (b.get("alts") or [])
-        if x in POSITIVE_ALTS or x == NEGATIVE_ALT
+    ordinary_rows = []
+    sleeper_rows = []
+
+    for row in rows:
+        kind = norm(row.get("kind"))
+        alts = [
+            alt for alt in (row.get("statusAlts") or [])
+            if alt in POSITIVE_ALTS or alt == NEGATIVE_ALT
+        ]
+
+        if not alts:
+            continue
+
+        item = {
+            "label": kind,
+            "alts": alts,
+        }
+
+        if kind in {"B寝台", "A寝台"}:
+            sleeper_rows.append(item)
+        else:
+            ordinary_rows.append(item)
+
+    b_rows = [
+        item for item in sleeper_rows
+        if item["label"] == "B寝台"
     ]
-    a_alts = [
-        x for x in (a.get("alts") or [])
-        if x in POSITIVE_ALTS or x == NEGATIVE_ALT
+    a_rows = [
+        item for item in sleeper_rows
+        if item["label"] == "A寝台"
     ]
 
-    if not b_alts or not a_alts:
+    if not b_rows or not a_rows:
         raise TemporaryPageError(
-            "B寝台/A寝台の空席画像altを取得できない"
-            f" (B={b_alts}, A={a_alts})"
+            "B寝台/A寝台の空席行を取得できない"
+            f" (B={len(b_rows)}, A={len(a_rows)})"
         )
 
-    ordinary_alts = [
-        x for x in (ordinary.get("alts") or [])
-        if x in POSITIVE_ALTS or x == NEGATIVE_ALT
-    ]
-
-    if ordinary_alts:
+    if ordinary_rows:
+        ordinary_text = " / ".join(
+            f"{item['label']}:{'/'.join(item['alts'])}"
+            for item in ordinary_rows
+        )
         print(
-            "  -> 参考（通知対象外）: "
-            f"普通:{'/'.join(ordinary_alts)}",
+            f"  -> 参考（通知対象外）: {ordinary_text}",
             flush=True,
         )
-
-    sleeper_rows = [
-        {"label": "B寝台", "alts": b_alts},
-        {"label": "A寝台", "alts": a_alts},
-    ]
 
     positives = []
     total_marks = 0
@@ -721,10 +784,13 @@ def read_initial_route_status(page) -> dict:
             elif alt == NEGATIVE_ALT:
                 negative_marks += 1
 
+    sleeper_text = " / ".join(
+        f"{item['label']}:{'/'.join(item['alts'])}"
+        for item in sleeper_rows
+    )
+
     print(
-        "  -> 寝台判定: "
-        f"B寝台:{'/'.join(b_alts)} / "
-        f"A寝台:{'/'.join(a_alts)}",
+        f"  -> 寝台判定: {sleeper_text}",
         flush=True,
     )
 
