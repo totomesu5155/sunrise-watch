@@ -1,8 +1,10 @@
 name: Sunrise Izumo Watch
 
 on:
+  # GitHub scheduleの最短は5分。
+  # 毎時 03,08,13,...58 分に起動する。
   schedule:
-    - cron: '2/5 * * * *'
+    - cron: '3/5 * * * *'
   workflow_dispatch:
     inputs:
       test_ntfy:
@@ -14,6 +16,8 @@ on:
 permissions:
   contents: read
 
+# 同じ監視を同時に走らせない。
+# 前のrunが少し長引いた場合は次のrunを待たせる。
 concurrency:
   group: sunrise-izumo-watch
   cancel-in-progress: false
@@ -22,6 +26,7 @@ jobs:
   watch:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
     env:
       NTFY_TOPIC_URL: ${{ secrets.NTFY_TOPIC_URL }}
       TRIP_LABEL: ${{ secrets.TRIP_LABEL }}
@@ -77,9 +82,35 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.test_ntfy == true
         run: python sunrise_watch_actions.py --test-ntfy
 
-      - name: Check e5489 once
+      # scheduleの1回が落ちても監視間隔が開きすぎないよう、
+      # 1つのActions runの中で約3分半、複数回確認する。
+      # 通常時はおおむね1～2分台で次の確認になる。
+      # Python自身がe5489一時エラー時に再試行するため、
+      # エラーが多い時は1回の確認に時間がかかり、回数は減る。
+      - name: Monitor e5489 for 3.5 minutes
         if: github.event_name != 'workflow_dispatch' || inputs.test_ntfy != true
-        run: python sunrise_watch_actions.py
+        shell: bash
+        run: |
+          end=$((SECONDS + 210))
+          pass=1
+
+          while true; do
+            echo "============================================================"
+            echo "MONITOR PASS ${pass}"
+            echo "============================================================"
+
+            python sunrise_watch_actions.py
+
+            remaining=$((end - SECONDS))
+            if [ "$remaining" -lt 70 ]; then
+              echo "監視ウィンドウ終了"
+              break
+            fi
+
+            echo "60秒後にもう一度確認します"
+            sleep 60
+            pass=$((pass + 1))
+          done
 
       - name: Ensure monitor state exists
         if: always() && (github.event_name != 'workflow_dispatch' || inputs.test_ntfy != true)
