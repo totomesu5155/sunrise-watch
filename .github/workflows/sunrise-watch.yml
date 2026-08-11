@@ -33,7 +33,8 @@ jobs:
       DEPART_HOUR: ${{ secrets.DEPART_HOUR }}
       DEPART_MINUTE: ${{ secrets.DEPART_MINUTE }}
       STATE_FILE: .state/sunrise_state.json
-      SUNRISE_MAX_ATTEMPTS: '1'
+      SUNRISE_MAX_ATTEMPTS: '2'
+      SUNRISE_SIGNAL_EXIT: '1'
 
     steps:
       - name: Checkout
@@ -80,12 +81,13 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.test_ntfy == true
         run: python sunrise_watch_actions.py --test-ntfy
 
-      - name: Dense monitor for 55 minutes
+      - name: Stable dense monitor
         if: github.event_name != 'workflow_dispatch' || inputs.test_ntfy != true
         shell: bash
         run: |
           end=$((SECONDS + 3300))
           pass=1
+          error_streak=0
 
           while true; do
             hour=$(TZ=Asia/Tokyo date +%H)
@@ -98,19 +100,41 @@ jobs:
             fi
 
             echo "============================================================"
-            echo "DENSE MONITOR PASS ${pass}"
+            echo "STABLE DENSE PASS ${pass}"
             echo "============================================================"
 
+            set +e
             python sunrise_watch_actions.py
+            rc=$?
+            set -e
 
             remaining=$((end - SECONDS))
-            if (( remaining < 90 )); then
+            if (( remaining < 150 )); then
               echo "55分監視ウィンドウを終了します"
               break
             fi
 
-            wait=$((35 + RANDOM % 16))
-            echo "${wait}秒後に新しいセッションで再確認します"
+            if (( rc == 2 )); then
+              error_streak=$((error_streak + 1))
+              if (( error_streak == 1 )); then
+                wait=$((120 + RANDOM % 31))
+              elif (( error_streak == 2 )); then
+                wait=$((180 + RANDOM % 41))
+              else
+                wait=$((240 + RANDOM % 61))
+              fi
+              echo "確認不能が ${error_streak} 回連続。${wait}秒休んで再確認します"
+            else
+              error_streak=0
+              wait=$((80 + RANDOM % 31))
+              echo "確認完遂。${wait}秒後に新しいセッションで再確認します"
+            fi
+
+            if (( remaining <= wait + 60 )); then
+              echo "残り時間が少ないため終了します"
+              break
+            fi
+
             sleep "$wait"
             pass=$((pass + 1))
           done
