@@ -17,6 +17,8 @@ from playwright.sync_api import sync_playwright
 
 JST = ZoneInfo("Asia/Tokyo")
 
+SCRIPT_VERSION = "2026-08-11-mobile-exact-v1"
+
 # JR側にアクセスしない時間
 MAINTENANCE_START = dt_time(1, 30)
 MAINTENANCE_END = dt_time(5, 30)
@@ -28,16 +30,16 @@ STATE_FILE = Path(os.getenv("STATE_FILE", ".state/sunrise_state.json"))
 
 # e5489は同じ条件でも一時的な「ご案内」を返すことがあるため、
 # 1巡回内で複数回試す。
-# DENSE監視内でも再実行されるため、1巡回内のリトライは3回を上限にする
-MAX_ATTEMPTS = max(1, int(os.getenv("SUNRISE_MAX_ATTEMPTS", "3")))
+# 1巡回内で最大10回。成功した時点で終了するが、失敗時は10回まで粘る
+MAX_ATTEMPTS = max(1, int(os.getenv("SUNRISE_MAX_ATTEMPTS", "10")))
 
 # 失敗時の段階的な待ち時間（秒）
-RETRY_BACKOFF_SECONDS = (15, 30, 60)
+RETRY_BACKOFF_SECONDS = (10, 15, 20, 30, 45, 60, 75, 90, 105)
 # 失敗時の最大待ち時間上限（120秒）
 MAX_BACKOFF_SECONDS = 120
 
-# 1巡回が長くなりすぎないよう最大4分で打ち切る
-MAX_RUN_SECONDS = int(os.getenv("SUNRISE_MAX_RUN_SECONDS", "240"))
+# 10回リトライを許容しつつ、1巡回は最大15分で必ず打ち切る
+MAX_RUN_SECONDS = int(os.getenv("SUNRISE_MAX_RUN_SECONDS", "900"))
 
 POSITIVE_ALTS = {"空席あり", "空席残りわずか"}
 NEGATIVE_ALT = "残席なし"
@@ -497,42 +499,57 @@ def submit_search(page) -> None:
             "「検索する（新規予約）」ボタンが見つからない"
         )
 
+    print("  -> 「検索する」をクリック", flush=True)
+
     try:
         with page.expect_navigation(
             wait_until="domcontentloaded",
-            timeout=20000,
+            timeout=15000,
         ):
-            button.first.click()
+            button.first.click(timeout=8000)
     except Exception:
-        # navigationイベントを取り逃した場合も、実ページを見て続行する。
-        page.wait_for_timeout(1200)
+        # navigationイベントを取り逃した場合でも実ページを確認する。
+        page.wait_for_timeout(800)
+
+    print(
+        f"  -> 検索クリック後: title={page.title()!r}, "
+        f"path={current_path(page)!r}",
+        flush=True,
+    )
 
     if is_guide_or_error(page):
         raise TemporaryPageError("検索後にご案内/エラー")
 
-    # 重要:
-    # この画面の実HTMLでは空席一覧は table.seat-status-table ではなく、
-    # dl.car-grouping-list の中に「普通 / B寝台 / A寝台」が並んでいる。
-    # seat-status-table は保存HTML内のCSS定義には存在するが、
-    # この検索結果本文には存在しない。
-    groups = page.locator("dl.car-grouping-list")
-
+    # 実際に保存されたスマホ版(cssp)のHTMLでは、
+    # dl.car-grouping-list > dt の中に
+    # img[alt="B寝台"] / img[alt="A寝台"] がある。
     try:
-        groups.first.wait_for(
+        page.locator(
+            'dl.car-grouping-list > dt img[alt="B寝台"]'
+        ).first.wait_for(
             state="attached",
-            timeout=10000,
+            timeout=12000,
+        )
+        page.locator(
+            'dl.car-grouping-list > dt img[alt="A寝台"]'
+        ).first.wait_for(
+            state="attached",
+            timeout=12000,
         )
     except Exception:
-        body = norm(page.locator("body").inner_text(timeout=5000))
+        body = norm(
+            page.locator("body").inner_text(timeout=5000)
+        )
         raise TemporaryPageError(
             "経路・設備選択ページには到達したが、"
-            "B寝台/A寝台の一覧（car-grouping-list）が見つからない; "
-            f"sunrise={'サンライズ出雲' in body}"
+            "スマホ版のB寝台/A寝台見出しを確認できない"
+            f" (sunrise={'サンライズ出雲' in body}, "
+            f"B寝台={'B寝台' in body}, "
+            f"A寝台={'A寝台' in body})"
         )
 
     print(
-        f"  -> 検索結果: {current_path(page)} "
-        f"(car-grouping-list={groups.count()})",
+        f"  -> 検索結果画面を確認: {current_path(page)}",
         flush=True,
     )
 
@@ -542,58 +559,152 @@ def submit_search(page) -> None:
 # ------------------------------------------------------------
 
 def read_initial_route_status(page) -> dict:
-    groups = page.locator("dl.car-grouping-list")
+    """
+    スマホ版(cssp)の実HTML構造に合わせて判定する。
 
-    if groups.count() == 0:
-        raise TemporaryPageError(
-            "最初の空席一覧（car-grouping-list）が見つからない"
-        )
+    dl.car-grouping-list
+      dt  普通
+      dd  ... 空席画像
+      dt  <img alt="B寝台">B寝台
+      dd  ... 空席画像
+      dt  <img alt="A寝台">A寝台
+      dd  ... 空席画像
 
-    sleeper_rows = []
-    ordinary_rows = []
+    dtの直後のddだけを対象にするため、
+    「普通」の△を寝台空席として誤認しない。
+    """
 
-    for g in range(groups.count()):
-        dl = groups.nth(g)
-        dts = dl.locator(":scope > dt")
+    result = page.evaluate(
+        """() => {
+            const STATUS = new Set([
+                '空席あり',
+                '空席残りわずか',
+                '残席なし'
+            ]);
 
-        for i in range(dts.count()):
-            dt = dts.nth(i)
-            label = norm(dt.inner_text())
+            const normalize = s =>
+                (s || '').replace(/\\s+/g, ' ').trim();
 
-            dd = dt.locator("xpath=following-sibling::dd[1]")
+            function findDt(kind) {
+                const all = Array.from(
+                    document.querySelectorAll(
+                        'dl.car-grouping-list > dt'
+                    )
+                );
 
-            if dd.count() == 0:
-                continue
+                if (kind === '普通') {
+                    return all.find(dt =>
+                        normalize(dt.textContent).includes('普通')
+                    ) || null;
+                }
 
-            imgs = dd.locator(
-                'img[alt="空席あり"], '
-                'img[alt="空席残りわずか"], '
-                'img[alt="残席なし"]'
-            )
-
-            alts = []
-            for j in range(imgs.count()):
-                alt = imgs.nth(j).get_attribute("alt")
-                if alt:
-                    alts.append(alt)
-
-            if not alts:
-                continue
-
-            row = {
-                "label": label,
-                "alts": alts,
+                return all.find(dt =>
+                    dt.querySelector(`img[alt="${kind}"]`) ||
+                    normalize(dt.textContent).includes(kind)
+                ) || null;
             }
 
-            if "B寝台" in label or "A寝台" in label:
-                sleeper_rows.append(row)
-            else:
-                ordinary_rows.append(row)
+            function collect(kind) {
+                const dt = findDt(kind);
 
-    if not sleeper_rows:
+                if (!dt) {
+                    return {
+                        kind,
+                        found: false,
+                        alts: []
+                    };
+                }
+
+                const dd = dt.nextElementSibling;
+
+                if (!dd || dd.tagName !== 'DD') {
+                    return {
+                        kind,
+                        found: true,
+                        ddFound: false,
+                        alts: []
+                    };
+                }
+
+                const alts = Array.from(
+                    dd.querySelectorAll('img[alt]')
+                )
+                .map(img => img.getAttribute('alt'))
+                .filter(alt => STATUS.has(alt));
+
+                return {
+                    kind,
+                    found: true,
+                    ddFound: true,
+                    alts
+                };
+            }
+
+            return {
+                ordinary: collect('普通'),
+                b: collect('B寝台'),
+                a: collect('A寝台'),
+                groupCount: document.querySelectorAll(
+                    'dl.car-grouping-list'
+                ).length
+            };
+        }"""
+    )
+
+    ordinary = result.get("ordinary") or {}
+    b = result.get("b") or {}
+    a = result.get("a") or {}
+
+    print(
+        "  -> スマホ版DOM解析: "
+        f"groups={result.get('groupCount', 0)}, "
+        f"普通={ordinary.get('alts', [])}, "
+        f"B寝台={b.get('alts', [])}, "
+        f"A寝台={a.get('alts', [])}",
+        flush=True,
+    )
+
+    if not b.get("found") or not a.get("found"):
         raise TemporaryPageError(
-            "B寝台/A寝台の空席状態を取得できない"
+            "B寝台/A寝台の見出しを取得できない"
         )
+
+    if not b.get("ddFound") or not a.get("ddFound"):
+        raise TemporaryPageError(
+            "B寝台/A寝台の空席欄(dd)を取得できない"
+        )
+
+    b_alts = [
+        x for x in (b.get("alts") or [])
+        if x in POSITIVE_ALTS or x == NEGATIVE_ALT
+    ]
+    a_alts = [
+        x for x in (a.get("alts") or [])
+        if x in POSITIVE_ALTS or x == NEGATIVE_ALT
+    ]
+
+    if not b_alts or not a_alts:
+        raise TemporaryPageError(
+            "B寝台/A寝台の空席画像altを取得できない"
+            f" (B={b_alts}, A={a_alts})"
+        )
+
+    ordinary_alts = [
+        x for x in (ordinary.get("alts") or [])
+        if x in POSITIVE_ALTS or x == NEGATIVE_ALT
+    ]
+
+    if ordinary_alts:
+        print(
+            "  -> 参考（通知対象外）: "
+            f"普通:{'/'.join(ordinary_alts)}",
+            flush=True,
+        )
+
+    sleeper_rows = [
+        {"label": "B寝台", "alts": b_alts},
+        {"label": "A寝台", "alts": a_alts},
+    ]
 
     positives = []
     total_marks = 0
@@ -604,29 +715,25 @@ def read_initial_route_status(page) -> dict:
             total_marks += 1
 
             if alt in POSITIVE_ALTS:
-                positives.append(f"{item['label']}:{alt}")
+                positives.append(
+                    f"{item['label']}:{alt}"
+                )
             elif alt == NEGATIVE_ALT:
                 negative_marks += 1
 
-    if ordinary_rows:
-        ordinary_text = " / ".join(
-            f"{item['label']}:{'/'.join(item['alts'])}"
-            for item in ordinary_rows
-        )
-        print(f"  -> 参考（通知対象外）: {ordinary_text}", flush=True)
-
-    sleeper_text = " / ".join(
-        f"{item['label']}:{'/'.join(item['alts'])}"
-        for item in sleeper_rows
+    print(
+        "  -> 寝台判定: "
+        f"B寝台:{'/'.join(b_alts)} / "
+        f"A寝台:{'/'.join(a_alts)}",
+        flush=True,
     )
-
-    print(f"  -> 寝台判定: {sleeper_text}", flush=True)
 
     return {
         "rows": sleeper_rows,
         "positives": positives,
         "all_negative": (
-            total_marks > 0 and negative_marks == total_marks
+            total_marks > 0
+            and negative_marks == total_marks
         ),
         "total": total_marks,
     }
@@ -911,6 +1018,11 @@ def perform_check(page) -> tuple[bool, str]:
 
 
 def run_once() -> int:
+    print(
+        f"[{now_text()}] SCRIPT_VERSION={SCRIPT_VERSION}",
+        flush=True,
+    )
+
     if in_maintenance():
         print(
             f"[{now_text()}] 01:30-05:30 JST は監視停止。"
@@ -942,6 +1054,9 @@ def run_once() -> int:
                     timezone_id="Asia/Tokyo",
                 )
                 page = context.new_page()
+                # 1操作が長時間ぶら下がらないよう上限を設定。
+                page.set_default_timeout(10000)
+                page.set_default_navigation_timeout(15000)
 
                 try:
                     print(
@@ -1004,7 +1119,8 @@ def run_once() -> int:
                 print(
                     f"  -> セッションを破棄しました。"
                     f"{wait_seconds:.0f}秒後にトップから"
-                    "新しいセッションで再試行します",
+                    f"新しいセッションで再試行します "
+                    f"(次回 {attempt + 1}/{MAX_ATTEMPTS})",
                     flush=True,
                 )
                 time.sleep(wait_seconds)
